@@ -4,3 +4,13 @@
 abp1250model*
 PulseDB_MIMIC/*
 PulseDB_Vital/*
+personalized_training_data/*
+personalized_training_data_MIMIC/*
+processed_data/*
+training_data*/*
+
+pulse_database
+pulsedb_annotations
+*.sqlite3
+*.sql
+*npy

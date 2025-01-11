@@ -5,11 +5,106 @@ import torch
 import json
 import scipy
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, TensorDataset, DataLoader
 import h5py
 from tqdm import tqdm
 import sqlite3
 import multiprocessing
+from sklearn.model_selection import train_test_split
+import random
+import torch.nn.functional as F
+
+def find_max_sequence_length(file_list, h5_folder):
+    max_length = 0
+    
+    for filename in tqdm(file_list):
+        h5_path = os.path.join(h5_folder, filename)
+        with h5py.File(h5_path, 'r') as f:
+            ppg_raw = f['PPG_Raw'][:]
+            abp_speaks = f['ABP_SPeaks'][:]
+            abp_turns = f['ABP_Turns'][:]
+        
+        for i in range(len(ppg_raw)):
+            speaks = torch.LongTensor(abp_speaks[i])
+            turns = torch.LongTensor(abp_turns[i])
+            
+            bp_points = torch.cat([speaks, turns], dim=0).sort().values
+            bp_length = len(bp_points)  # bp_relative的長度為bp_points長度減2
+            
+            if bp_length > max_length:
+                max_length = bp_length
+    
+    return max_length
+
+
+def process_and_save_data(h5_folder, output_folder, batch_size=128, test_size=0.005):
+    h5_files = [f for f in os.listdir(h5_folder) if f.endswith('.h5')]
+    train_files, test_files = train_test_split(h5_files, test_size=test_size, random_state=42)
+    # input(f'test_files:{test_files}')
+    max_seq_len = 58#find_max_sequence_length(h5_files, h5_folder)
+    print(f'Max sequence length: {max_seq_len}')
+
+    process_dataset(train_files, h5_folder, os.path.join(output_folder, 'train'), batch_size, max_seq_len)
+    process_dataset(test_files, h5_folder, os.path.join(output_folder, 'test'), batch_size, max_seq_len)
+
+
+def process_dataset(file_list, h5_folder, output_folder, batch_size, max_seq_len):
+    os.makedirs(output_folder, exist_ok=True)
+    
+    batch_num = 0
+    batch_data = []
+    
+    for filename in tqdm(file_list):
+        h5_path = os.path.join(h5_folder, filename)
+        with h5py.File(h5_path, 'r') as f:
+            ppg_raw = f['PPG_Raw'][:]
+            abp_f = f['ABP_F'][:]
+            abp_speaks = f['ABP_SPeaks'][:]
+            abp_turns = f['ABP_Turns'][:]
+        
+        for i in range(len(ppg_raw)):
+            ppg = torch.FloatTensor(ppg_raw[i])
+            abp = torch.FloatTensor(abp_f[i, 0])
+            speaks = torch.LongTensor(abp_speaks[i])
+            turns = torch.LongTensor(abp_turns[i])
+            
+            bp_points = torch.cat([speaks, turns], dim=0).sort().values
+            bp = abp[bp_points-1]
+            
+            # 填充 BP 序列
+            bp_padded = F.pad(bp, (0, max_seq_len - len(bp)), 'constant', 0)
+            
+            # 可選：打印當前的 BP 序列以進行檢查
+            # print(f"Current bp sequence: {bp}")
+            # print(f"Padded bp sequence: {bp_padded}")
+            
+            batch_data.append((ppg.unsqueeze(0), bp_padded))
+            
+            if len(batch_data) >= batch_size:
+                save_batch(batch_data, output_folder, batch_num)
+                batch_num += 1
+                batch_data = []
+    
+    if batch_data:
+        save_batch(batch_data, output_folder, batch_num)
+
+
+
+def save_batch(batch_data, output_folder, batch_num):
+    ppgs, bps = zip(*batch_data)
+    ppgs = torch.cat(ppgs, dim=0)  # (batch_size, 1, sequence_length)
+    bps = torch.nn.utils.rnn.pad_sequence(bps, batch_first=True, padding_value=0)
+    
+    torch.save((ppgs, bps), os.path.join(output_folder, f'batch_{batch_num}.pt'))
+
+def save_batch(batch_data, output_folder, batch_num):
+    ppgs, bps = zip(*batch_data)
+    ppgs = torch.cat(ppgs, dim=0)  # (batch_size, 1, sequence_length)
+    bps = torch.nn.utils.rnn.pad_sequence(bps, batch_first=True, padding_value=0)
+    
+    torch.save((ppgs, bps), os.path.join(output_folder, f'batch_{batch_num}.pt'))
+
+
 def save_encoded_data(encoded_data, output_dir):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -407,6 +502,11 @@ def main_data_preprocess():
     process_mat_files(data_folder, db_conn)
     db_conn.close()
 
+def main_data_to_tensor():
+    h5_folder = "processed_data"
+    output_folder = "tensor_data"
+
+    process_and_save_data(h5_folder, output_folder)
 
 if __name__ == '__main__':
-    main_data_preprocess()
+    main_data_to_tensor()
