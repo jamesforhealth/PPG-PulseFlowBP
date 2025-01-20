@@ -4,19 +4,22 @@ import h5py
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QListWidget, QCheckBox, QComboBox, QSlider, QLabel, QTextEdit)
+                             QPushButton, QListWidget, QCheckBox, QComboBox, QSlider, QLabel, QTextEdit, QGroupBox)
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont
 # from model_abp_1250points import ConvAutoencoder, ConvAutoencoder2, predict_reconstructed_1250abp
 # from model_pulse_representation import predict_reconstructed_abp
 # from abp_anomaly_detection_algorithms import detect_anomaly_gui, calculate_dtw_scores
 from load_normap_ABP_data import load_training_set
 import pickle
-# import torch
+import torch
 from scipy.ndimage import gaussian_filter1d
 import scipy
 from scipy.signal import butter, filtfilt
 import matplotlib.pyplot as plt
-from prepare_training_data_vitaldb import check_signal_quality
+from prepare_training_data_vitaldb import check_ppg_quality
+from ECG_segment_autoencoder import ECGAutoencoder
+import torch.nn.functional as F
 def lowpass_filter(data, cutoff, fs, order=2):
     nyquist = 0.5 * fs
     normal_cutoff = cutoff / nyquist
@@ -36,7 +39,12 @@ class CustomViewBox(pg.ViewBox):
         if ev.button() == Qt.LeftButton:
             pg.ViewBox.mouseDragEvent(self, ev, axis)
 
-    def wheelEvent(self, ev):
+    def wheelEvent(self, ev, axis=None):
+        # 根據自己想要的行為來調整
+        # 如果完全不需要用到 axis，可忽略之或傳給 super
+        if axis is not None:
+            # pyqtgraph 可能傳進來 axis=0/1，代表 x 或 y 軸
+            pass
         if ev.modifiers() & Qt.ControlModifier:
             self.scaleBy((1.1**(-ev.delta() * 0.001), 1), center=(0.5, 0.5))
         else:
@@ -45,6 +53,13 @@ class CustomViewBox(pg.ViewBox):
 class PulseDBViewer(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        # self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # self.ecg_model = ECGAutoencoder().to(self.device)
+        # self.ecg_model.load_state_dict(torch.load('ecg_autoencoder_test.pth'))
+        # self.ecg_model.eval()
+
+
         self.setWindowTitle("PulseDB Signal Viewer")    
         self.resize(1200, 800)
 
@@ -108,7 +123,7 @@ class PulseDBViewer(QMainWindow):
         self.checkboxes = {}
         for signal in ['ABP_Raw', 'ABP_F', 'ABP_SPeaks', 'ABP_Turns', 'ECG_Raw', 'ECG_F', 'ECG_RPeaks', 'PPG_Raw', 'PPG_F', 'PPG_SPeaks', 'PPG_Turns', 'Reconstructed_ABP']:
             self.checkboxes[signal] = QCheckBox(signal)
-            self.checkboxes[signal].setChecked(False) if 'ABP' in signal else self.checkboxes[signal].setChecked(True)
+            self.checkboxes[signal].setChecked(False) if signal in ['ABP_F', 'ECG_Raw', 'PPG_Raw'] else self.checkboxes[signal].setChecked(True)
             self.checkboxes[signal].stateChanged.connect(self.update_plot)
             left_layout.addWidget(self.checkboxes[signal])
 
@@ -116,6 +131,40 @@ class PulseDBViewer(QMainWindow):
         self.meta_info = QTextEdit()
         self.meta_info.setReadOnly(True)
         left_layout.addWidget(self.meta_info)
+
+        # 在左下角添加显示区域
+        self.info_label = QLabel()
+        self.info_label.setWordWrap(True)
+        left_layout.addWidget(self.info_label)
+
+        # 在左下方添加 segment 分析結果區域
+        self.analysis_group = QGroupBox("Segment 分析結果")
+        analysis_layout = QVBoxLayout()
+
+        # 創建用於顯示分析結果的文本框
+        self.analysis_text = QTextEdit()
+        self.analysis_text.setReadOnly(True)
+        self.analysis_text.setMinimumHeight(150)
+        self.analysis_text.setMaximumHeight(200)
+        
+        # 設置字體
+        font = QFont("Consolas", 9)
+        self.analysis_text.setFont(font)
+        
+        # 設置樣式
+        self.analysis_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #f5f5f5;
+                border: 1px solid #ddd;
+                padding: 5px;
+            }
+        """)
+        
+        analysis_layout.addWidget(self.analysis_text)
+        self.analysis_group.setLayout(analysis_layout)
+        
+        # 添加到左側布局
+        left_layout.addWidget(self.analysis_group)
 
         # # 右側面板 - 繪圖區域
         # self.plot_widget = pg.PlotWidget(viewBox=CustomViewBox())
@@ -217,39 +266,51 @@ class PulseDBViewer(QMainWindow):
         self.update_plot()
 
     def load_mat_file(self, file_path):
+        print(f"Loading file: {file_path}")
         with h5py.File(file_path, 'r') as f:
             matdata = f['Subj_Wins']
+            print(f"Available keys: {list(matdata.keys())}")
             self.data = {}
+            
             for key in matdata.keys():
-                if key in ['ABP_Raw', 'ABP_F', 'ECG_Raw', 'ECG_F', 'PPG_Raw', 'PPG_F']:
-                    self.data[key] = [f[ref][:].flatten() for ref in matdata[key][0]]
-                elif key in ['ABP_SPeaks', 'ABP_Turns', 'ECG_RPeaks', 'PPG_SPeaks', 'PPG_Turns']:
-                    self.data[key] = [f[ref][:].flatten().astype(int) for ref in matdata[key][0]]
-                elif key in ['SegmentID', 'CaseID', 'SubjectID']:
-                    # 印出 SegmentID, CaseID, SubjectID 的實際值
+                # print(f"\nProcessing key: {key}")
+                try:
+                    if key in ['ABP_Raw', 'ABP_F', 'ECG_Raw', 'ECG_F', 'PPG_Raw', 'PPG_F']:
+                        self.data[key] = []
+                        for i, ref in enumerate(matdata[key][0]):
+                            data = f[ref][:]
+                            # print(f"  {key} segment {i}: shape={data.shape}, dtype={data.dtype}")
+                            self.data[key].append(data.flatten())
+                            
+                    elif key in ['ABP_SPeaks', 'ABP_Turns', 'ECG_RPeaks', 'ECG_RealPeaks', 'PPG_SPeaks', 'PPG_Turns']:
+                        self.data[key] = []
+                        for i, ref in enumerate(matdata[key][0]):
+                            data = f[ref][:]
+                            # print(f"  {key} segment {i}: {len(data)} points")
+                            self.data[key].append(data.flatten().astype(np.int64))
+                            
+                    else:
+                        self.data[key] = []
+                        for i, ref in enumerate(matdata[key][0]):
+                            value = f[ref][()]
+                            # print(f"  {key} value {i}: {value}")
+                            if isinstance(value, np.ndarray):
+                                value = value.squeeze()
+                                if value.size == 1:
+                                    value = value.item()
+                                else:
+                                    value = value.tolist()
+                            self.data[key].append(value)
+                            
+                    # print(f"Successfully processed {key}")
+                    
+                except Exception as e:
+                    print(f"Error processing {key}: {str(e)}")
                     self.data[key] = []
-                    for ref in matdata[key][0]:
-                        value = f[ref][()]
-                        if isinstance(value, bytes):
-                            value = value.decode('utf-8')  # 解碼為字符串
-                        elif isinstance(value, np.ndarray):
-                            value = value.tolist()  # 轉換為列表
-                        self.data[key].append(value)
-                    print(f"{key}: {self.data[key]}")
-                else:
-                    # 其他欄位印出形狀
-                    self.data[key] = [f[ref][:] for ref in matdata[key][0]]
-                    print(f"{key} 的形狀: {matdata[key].shape}")
 
-        self.segment_slider.setMaximum(len(self.data['ABP_Raw']) - 1)
-        self.update_meta_info()
-        self.update_plot()
-        # 在加载数据后初始化重构误差图
-        if 'ABP_Raw' in self.data and len(self.data['ABP_Raw']) > 0:
-            self.plot_reconstruction_error(self.data['ABP_Raw'][0])
-        else:
-            print("警告: 文件中未找到 ABP_Raw 数据。")
-
+            self.segment_slider.setMaximum(len(self.data['ABP_Raw']) - 1)
+            self.update_meta_info()
+            self.update_plot()
 
     def load_training_set_info(self, file_path):
         self.training_abp_data, self.training_abp_turns, self.training_abp_speaks = load_training_set(file_path)
@@ -264,9 +325,22 @@ class PulseDBViewer(QMainWindow):
         if self.db_combo.currentText() == "training_set.npz":
             return
         meta_text = ""
-        for key in ['Age', 'BMI', 'CaseID', 'Gender', 'Height', 'IncludeFlag', 'SegDBP', 'SegSBP', 'SegmentID', 'SubjectID', 'Weight', 'WinID', 'WinSeqID']:
+        for key in ['Age', 'BMI', 'CaseID', 'Gender', 'Height', 'IncludeFlag',
+                    'SegDBP', 'SegSBP', 'SegmentID', 'SubjectID', 'Weight',
+                    'WinID', 'WinSeqID']:
             if key in self.data:
-                meta_text += f"{key}: {self.data[key][0][0]}\n"
+                value = self.data[key][0]  # 先取出第一个元素
+                # print(f"Key: {key}, Value: {value}, Type: {type(value)}")  # 调试信息
+# 检查 value 是否为可索引的（如数组）
+                if isinstance(value, (np.ndarray, list)):
+                    if len(value) == 1:
+                        # 如果只有一个元素，取出该元素
+                        value = value[0]
+                    else:
+                        # 如果有多个元素，将其转换为列表
+                        value = value.tolist() if isinstance(value, np.ndarray) else value
+                # 如果 value 是标量，直接使用
+                meta_text += f"{key}: {value}\n"
         self.meta_info.setText(meta_text)
 
     def update_dtw_plot(self, dtw_scores, turns):
@@ -293,6 +367,68 @@ class PulseDBViewer(QMainWindow):
         self.reconstruction_error_plot.setYRange(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
 
 
+
+    def compute_ecg_dtw_score(self, segment_idx):
+        """
+        1. 取得該 segment 的 ECG_F 資料 (長度 1250)
+        2. 取得該 segment 的 R-peak 位置清單(ECG_RPeaks)
+        3. 逐對相鄰peak切出 beat 片段
+        4. 逐對相鄰 beat 做 DTW，取得距離
+        5. 以 平均DTW距離 作為該 segment 的異常分數
+           → 值越大，表示各心拍形狀差異越大(可能越異常)
+        """
+        fs = 125
+        if 'ECG_F' not in self.data or 'ECG_RPeaks' not in self.data:
+            return None
+        
+        ecg_f = self.data['ECG_F'][segment_idx]  # shape (1250,)
+        peaks = self.data['ECG_RPeaks'][segment_idx]
+        peaks = peaks[peaks < len(ecg_f)]  # 避免越界
+        
+        if len(peaks) < 3:
+            # 若 R-peak 太少，無法形成有效 beat, 回傳無限大
+            return float('inf')
+        
+        # 收集 beat 片段
+        beat_segments = []
+        for i in range(len(peaks)-1):
+            start_idx = peaks[i]
+            end_idx   = peaks[i+1]
+            if end_idx <= start_idx:
+                continue
+            beat = ecg_f[start_idx:end_idx]
+            beat_segments.append(beat)
+        
+        # 逐對相鄰 beat 計算 DTW
+        distances = []
+        for i in range(len(beat_segments)-1):
+            dist = self.simple_dtw(beat_segments[i], beat_segments[i+1])
+            distances.append(dist)
+        
+        if len(distances) == 0:
+            return 0.0
+        
+        # 以平均 DTW 距離當異常分數
+        anomaly_score = float(np.mean(distances))
+        return anomaly_score
+
+    def simple_dtw(self, seq1, seq2):
+        """
+        一個簡單的 DTW 實作；如需更快可考慮 fastdtw 或其他庫
+        這裡僅示範概念
+        """
+        n, m = len(seq1), len(seq2)
+        dtw_mat = np.full((n+1, m+1), np.inf)
+        dtw_mat[0,0] = 0
+
+        for i in range(1, n+1):
+            for j in range(1, m+1):
+                cost = abs(seq1[i-1] - seq2[j-1])
+                dtw_mat[i,j] = cost + min(dtw_mat[i-1,j],    # 上
+                                          dtw_mat[i,j-1],    # 左
+                                          dtw_mat[i-1,j-1])  # 斜上
+        return dtw_mat[n,m]
+
     def update_plot(self):
         self.plot_widget.clear()
         self.normalized_plot_widget.clear()
@@ -301,250 +437,160 @@ class PulseDBViewer(QMainWindow):
 
         if self.db_combo.currentText() == "training_set.npz":
             if self.training_abp_data is not None:
-                x = np.arange(1250)  # 10 seconds at 125 Hz
+                x = np.arange(1250)
                 y = self.training_abp_data[segment]
                 self.plot_widget.plot(x, y, pen=pg.mkPen(color=(255, 0, 0), width=2))
-
-                # 顯示預先計算好的異常分數
-                self.anomaly_score_label.setText(f"Anomaly Score: {self.anomaly_scores[segment]:.4f}")
-                # self.svm_score_label.setText(f"SVM Score: {self.svm_scores[segment]:.4f}")
-                # self.if_score_label.setText(f"IF Score: {self.if_scores[segment]:.4f}")
-                turns = self.training_abp_turns[segment]
-                # dtws = calculate_dtw_scores(y, turns)
-                # self.update_dtw_plot(dtws, turns)
-
         else:
             if not self.data:
                 return
-
-            x = np.arange(1250)  # 10 seconds at 125 Hz
+            x = np.arange(1250)
             colors = {
-                'ABP': (255, 0, 0),          # 红色
-                'ABP_SPeaks': (0, 255, 0),   # 绿色
-                'ABP_Turns': (0, 0, 255),    # 蓝色
-                'ECG': (0, 255, 0),      # 綠色
-                'PPG': (0, 0, 255),      # 藍色
-                'ECG_peaks': (255, 0, 255),  # 洋紅色
-                'ECG_real_peaks': (255, 255, 0),  # 黃色
-                'PPG_peaks': (255, 165, 0),   # 橙色
-                'PPG_turns': (0, 255, 255)    # 青色
+                'ABP': (255, 0, 0),
+                'ABP_SPeaks': (0, 255, 0),
+                'ABP_Turns': (0, 0, 255),
+                'ECG': (0, 255, 0),
+                'PPG': (0, 0, 255),
+                'ECG_peaks': (255, 0, 255),
+                'ECG_real_peaks': (255, 255, 0),
+                'PPG_peaks': (255, 165, 0),
+                'PPG_turns': (0, 255, 255)
             }
 
-            # 处理 ABP_Raw 信号及其特征点
+            # ABP_Raw
             if self.checkboxes['ABP_Raw'].isChecked():
-                y_raw = self.data['ABP_Raw'][segment]
-                self.plot_widget.plot(x, y_raw, pen=pg.mkPen(color=colors['ABP'], width=2, name='ABP_Raw'))
-                
-                # 在 ABP_Raw 上显示 ABP_SPeaks
-                if self.checkboxes['ABP_SPeaks'].isChecked() and 'ABP_SPeaks' in self.data:
-                    peaks = self.data['ABP_SPeaks'][segment]
-                    peaks = peaks[peaks < len(y_raw)]
-                    y_peaks = y_raw[peaks]
-                    self.plot_widget.plot(peaks, y_peaks, pen=None, symbol='o', 
-                                        symbolPen=None, symbolSize=8, 
-                                        symbolBrush=colors['ABP_SPeaks'])
+                if 'ABP_Raw' in self.data:
+                    y_raw = self.data['ABP_Raw'][segment]
+                    self.plot_widget.plot(x, y_raw, pen=pg.mkPen(color=colors['ABP'], width=2, name='ABP_Raw'))
 
-                # 在 ABP_Raw 上显示 ABP_Turns
-                if self.checkboxes['ABP_Turns'].isChecked() and 'ABP_Turns' in self.data:
-                    turns = self.data['ABP_Turns'][segment]
-                    turns = turns[turns < len(y_raw)]
-                    y_turns = y_raw[turns]
-                    self.plot_widget.plot(turns, y_turns, pen=None, symbol='s', 
-                                        symbolPen=None, symbolSize=8, 
-                                        symbolBrush=colors['ABP_Turns'])
-
-            # 处理 ABP_F 信号及其特征点
+            # ABP_F
             if self.checkboxes['ABP_F'].isChecked():
-                y_norm = self.data['ABP_F'][segment]
-                self.normalized_plot_widget.plot(x, y_norm, 
-                                            pen=pg.mkPen(color=colors['ABP'], width=2, 
-                                            name='ABP_F'))
-                
-                # 在 ABP_F 上显示 ABP_SPeaks
-                if self.checkboxes['ABP_SPeaks'].isChecked() and 'ABP_SPeaks' in self.data:
-                    peaks = self.data['ABP_SPeaks'][segment]
-                    peaks = peaks[peaks < len(y_norm)]
-                    y_peaks = y_norm[peaks]
-                    self.normalized_plot_widget.plot(peaks, y_peaks, pen=None, symbol='o', 
-                                                symbolPen=None, symbolSize=8, 
-                                                symbolBrush=colors['ABP_SPeaks'])
-
-                # 在 ABP_F 上显示 ABP_Turns
-                if self.checkboxes['ABP_Turns'].isChecked() and 'ABP_Turns' in self.data:
-                    turns = self.data['ABP_Turns'][segment]
-                    turns = turns[turns < len(y_norm)]
-                    y_turns = y_norm[turns]
-                    self.normalized_plot_widget.plot(turns, y_turns, pen=None, symbol='s', 
-                                                symbolPen=None, symbolSize=8, 
-                                                symbolBrush=colors['ABP_Turns'])
-            # 處理ECG信號
-            if self.checkboxes['ECG_Raw'].isChecked():
-                y = self.data['ECG_Raw'][segment]
-                self.plot_widget.plot(x, y, pen=pg.mkPen(color=colors['ECG'], width=2, name='ECG_Raw'))
-                
-                if self.checkboxes['ECG_RPeaks'].isChecked():
+                if 'ABP_F' in self.data:
+                    y_norm = self.data['ABP_F'][segment]
+                    self.normalized_plot_widget.plot(x, y_norm, 
+                        pen=pg.mkPen(color=colors['ABP'], width=2, name='ABP_F'))
+            
+            # ECG_Raw
+            if self.checkboxes['ECG_Raw'].isChecked() and 'ECG_Raw' in self.data:
+                y_ecg = self.data['ECG_Raw'][segment]
+                self.plot_widget.plot(x, y_ecg, pen=pg.mkPen(color=colors['ECG'], width=2, name='ECG_Raw'))
+                if self.checkboxes['ECG_RPeaks'].isChecked() and 'ECG_RPeaks' in self.data:
                     peaks = self.data['ECG_RPeaks'][segment]
                     peaks = peaks[peaks < 1250]
-                    print(f'ECG peaks: {peaks}, length: {len(peaks)}')
-                    y_peaks = y[peaks]
-                    self.plot_widget.plot(peaks, y_peaks, pen=None, symbol='o', 
-                                        symbolPen=None, symbolSize=2, symbolBrush=colors['ECG'])
+                    y_peaks = y_ecg[peaks]
+                    self.plot_widget.plot(peaks, y_peaks, pen=None, 
+                        symbol='o', symbolPen=None, symbolSize=4, symbolBrush=colors['ECG_peaks'])
 
-            # 在normalized_plot_widget中顯示正規化的信號和peaks
-            for signal_type in ['ABP', 'ECG', 'PPG']:
-                if self.checkboxes[f'{signal_type}_F'].isChecked():
-                    y_norm = self.data[f'{signal_type}_F'][segment]
-                    self.normalized_plot_widget.plot(x, y_norm, 
-                                                   pen=pg.mkPen(color=colors[signal_type], width=2, 
-                                                   name=f'{signal_type}_F'))
-                    
-                    # ECG peaks 的處理
-                    if signal_type == 'ECG' and self.checkboxes['ECG_RPeaks'].isChecked():
-                        # 原始peaks（紅色）
-                        original_peaks = self.data['ECG_RPeaks'][segment]
-                        original_peaks = original_peaks[original_peaks < 1250]
-                        y_peaks = y_norm[original_peaks]
-                        
-                        # 顯示原始peaks
-                        scatter_original = pg.ScatterPlotItem(
-                            original_peaks, y_peaks,
-                            symbol='o',
-                            size=10,
-                            pen=pg.mkPen(colors['ECG_peaks'], width=2),
-                            brush=pg.mkBrush(colors['ECG_peaks']),
-                            name='Original_ECG_Peaks'
-                        )
-                        self.normalized_plot_widget.addItem(scatter_original)
-                        
-                        # 尋找真實peaks（黃色）
-                        real_peaks = self.find_real_peaks(y_norm, original_peaks)
-                        y_real_peaks = y_norm[real_peaks]
-                        
-                        # 顯示真實peaks
-                        scatter_real = pg.ScatterPlotItem(
-                            real_peaks, y_real_peaks,
-                            symbol='x',  # 使用不同的符號以區分
-                            size=15,
-                            pen=pg.mkPen(colors['ECG_real_peaks'], width=3),
-                            name='Real_ECG_Peaks'
-                        )
-                        self.normalized_plot_widget.addItem(scatter_real)
-                        
-                        # 添加垂直線標示兩種peaks的位置
-                        for peak, real_peak in zip(original_peaks, real_peaks):
-                            # 原始peak位置（紅色虛線）
-                            line_original = pg.InfiniteLine(
-                                pos=peak, 
-                                angle=90, 
-                                pen=pg.mkPen(color=colors['ECG_peaks'], width=1, style=Qt.DashLine)
-                            )
-                            # 真實peak位置（黃色虛線）
-                            line_real = pg.InfiniteLine(
-                                pos=real_peak, 
-                                angle=90, 
-                                pen=pg.mkPen(color=colors['ECG_real_peaks'], width=1, style=Qt.DashLine)
-                            )
-                            self.normalized_plot_widget.addItem(line_original)
-                            self.normalized_plot_widget.addItem(line_real)
-                        
-                        # 顯示peaks的差異統計
-                        diff = np.abs(real_peaks - original_peaks)
-                        avg_diff = np.mean(diff)
-                        max_diff = np.max(diff)
-                        self.meta_info.append(f"\nECG Peaks 差異統計:")
-                        self.meta_info.append(f"平均偏移: {avg_diff:.2f} 點")
-                        self.meta_info.append(f"最大偏移: {max_diff:.2f} 點")
+            # ECG_F
+            if self.checkboxes['ECG_F'].isChecked() and 'ECG_F' in self.data:
+                ecg_f = self.data['ECG_F'][segment]
+                self.normalized_plot_widget.plot(x, ecg_f, 
+                    pen=pg.mkPen(color=colors['ECG'], width=2, name='ECG_F'))
 
-                    # PPG peaks 和 turns 的處理
-                    if signal_type == 'PPG':
-                        # 處理 PPG peaks
-                        if self.checkboxes['PPG_SPeaks'].isChecked():
-                            peaks = self.data['PPG_SPeaks'][segment]
-                            peaks = peaks[peaks < 1250]
-                            y_peaks = y_norm[peaks]
-                            
-                            scatter_peaks = pg.ScatterPlotItem(
-                                peaks, y_peaks,
-                                symbol='o',
-                                size=10,
-                                pen=pg.mkPen(colors['PPG_peaks'], width=2),
-                                brush=pg.mkBrush(colors['PPG_peaks']),
-                                name='PPG_Peaks'
-                            )
-                            self.normalized_plot_widget.addItem(scatter_peaks)
-                            
-                            # 可選：添加垂直線標示peak位置
-                            for peak in peaks:
-                                line = pg.InfiniteLine(
-                                    pos=peak, 
-                                    angle=90, 
-                                    pen=pg.mkPen(color=colors['PPG_peaks'], width=1, style=Qt.DashLine)
-                                )
-                                self.normalized_plot_widget.addItem(line)
+                if self.checkboxes['ECG_RPeaks'].isChecked() and 'ECG_RPeaks' in self.data:
+                    peaks = self.data['ECG_RPeaks'][segment]
+                    peaks = peaks[peaks < 1250]
+                    y_peaks = ecg_f[peaks]
+                    scatter_peaks = pg.ScatterPlotItem(peaks, y_peaks,
+                        symbol='o', size=6, pen=pg.mkPen(colors['ECG_peaks'], width=2),
+                        brush=pg.mkBrush(colors['ECG_peaks']), name='ECG_RPeaks')
+                    self.normalized_plot_widget.addItem(scatter_peaks)
 
-                        # 處理 PPG turns
-                        if self.checkboxes['PPG_Turns'].isChecked():
-                            turns = self.data['PPG_Turns'][segment]
-                            turns = turns[turns < 1250]
-                            y_turns = y_norm[turns]
-                            
-                            scatter_turns = pg.ScatterPlotItem(
-                                turns, y_turns,
-                                symbol='s',  # 使用方形標記區分turns
-                                size=8,
-                                pen=pg.mkPen(colors['PPG_turns'], width=2),
-                                brush=pg.mkBrush(colors['PPG_turns']),
-                                name='PPG_Turns'
-                            )
-                            self.normalized_plot_widget.addItem(scatter_turns)
-                            
-                            # 可選：添加垂直線標示turns位置
-                            for turn in turns:
-                                line = pg.InfiniteLine(
-                                    pos=turn, 
-                                    angle=90, 
-                                    pen=pg.mkPen(color=colors['PPG_turns'], width=1, style=Qt.DashLine)
-                                )
-                                self.normalized_plot_widget.addItem(line)
-
-            if 'ABP_Raw' in self.data and 'ABP_Turns' in self.data and 'ABP_SPeaks' in self.data:
-                abp_data = self.data['ABP_Raw'][segment]
-                if self.checkbox_smoothed.isChecked():
-                    smoothed_abp = gaussian_filter1d(abp_data, sigma=3)
-                    self.plot_widget.plot(x, smoothed_abp, 
-                                        pen=pg.mkPen(color=(100, 155, 155), width=2, name='Smoothed ABP'))
-                    
-                    if self.checkbox_second_derivative.isChecked():
-                        second_derivative = self.calculate_second_derivative(segment)
-                        self.normalized_plot_widget.plot(x, second_derivative, 
-                                                       pen=pg.mkPen(color=(255, 0, 255), width=2, 
-                                                       name='ABP Second Derivative'))
-
-                    if self.checkbox_double_integrated.isChecked():
-                        double_integrated = self.calculate_double_integrated(second_derivative)
-                        self.normalized_plot_widget.plot(x, double_integrated, 
-                                                       pen=pg.mkPen(color=(0, 0, 0), width=2, 
-                                                       name='ABP Double Integrated'))
-
-            # 更新Peak資訊
-            self.update_peak_info()
+            # PPG_Raw
+            if self.checkboxes['PPG_Raw'].isChecked() and 'PPG_Raw' in self.data:
+                y_ppg = self.data['PPG_Raw'][segment]
+                self.plot_widget.plot(x, y_ppg, pen=pg.mkPen(color=colors['PPG'], width=2, name='PPG_Raw'))
+                if self.checkboxes['PPG_SPeaks'].isChecked() and 'PPG_SPeaks' in self.data:
+                    peaks = self.data['PPG_SPeaks'][segment]
+                    peaks = peaks[peaks < 1250]
+                    y_peaks = y_ppg[peaks]
+                    self.plot_widget.plot(peaks, y_peaks, pen=None, 
+                        symbol='o', symbolPen=None, symbolSize=4, symbolBrush=colors['PPG_peaks'])
+                if self.checkboxes['PPG_Turns'].isChecked() and 'PPG_Turns' in self.data:
+                    turns = self.data['PPG_Turns'][segment]
+                    turns = turns[turns < 1250]
+                    y_turns = y_ppg[turns]
+                    self.plot_widget.plot(turns, y_turns, pen=None, 
+                        symbol='o', symbolPen=None, symbolSize=4, symbolBrush=colors['PPG_turns'])
             
-            # 在更新绘图后，进行信号质量检查并更新界面显示
-            peaks_dict = {
-                'ECG_RealPeaks': self.data.get('ECG_RPeaks', [])[segment],
-                'PPG_SPeaks': self.data.get('PPG_SPeaks', [])[segment],
-                'PPG_Turns': self.data.get('PPG_Turns', [])[segment],
-            }
+            # PPG_F
+            if self.checkboxes['PPG_F'].isChecked() and 'PPG_F' in self.data:
+                ppg_f = self.data['PPG_F'][segment]
+                self.normalized_plot_widget.plot(x, ppg_f, 
+                    pen=pg.mkPen(color=colors['PPG'], width=2, name='PPG_F'))
+                
+                if self.checkboxes['PPG_SPeaks'].isChecked() and 'PPG_SPeaks' in self.data:
+                    peaks = self.data['PPG_SPeaks'][segment]
+                    peaks = peaks[peaks < 1250]
+                    y_peaks = ppg_f[peaks]
+                    scatter_peaks = pg.ScatterPlotItem(peaks, y_peaks,
+                        symbol='o', size=6, pen=pg.mkPen(colors['PPG_peaks'], width=2),
+                        brush=pg.mkBrush(colors['PPG_peaks']), name='PPG_SPeaks')
+                    self.normalized_plot_widget.addItem(scatter_peaks)
 
-            # 检查特征点是否存在
-            if any(len(peaks) == 0 for peaks in peaks_dict.values()):
-                self.quality_label.setText("信号质量：不合格（缺少特征点）")
-            else:
-                quality_pass = check_signal_quality(peaks_dict)
-                if quality_pass:
-                    self.quality_label.setText("信号质量：合格")
-                else:
-                    self.quality_label.setText("信号质量：不合格")
+                if self.checkboxes['PPG_Turns'].isChecked() and 'PPG_Turns' in self.data:
+                    turns = self.data['PPG_Turns'][segment]
+                    turns = turns[turns < 1250]
+                    y_turns = ppg_f[turns]
+                    self.normalized_plot_widget.plot(turns, y_turns, pen=None, 
+                        symbol='o', symbolPen=None, symbolSize=4, symbolBrush=colors['PPG_turns'])
+
+        segment = self.segment_slider.value()
+        fs = 125.0
+
+        # 顯示信號質量 (以 PPG/ECG peaks 做簡單判斷)
+        peaks_dict = {
+            'ECG_RealPeaks': self.data.get('ECG_RPeaks', [])[segment],
+            'PPG_SPeaks': self.data.get('PPG_SPeaks', [])[segment],
+            'PPG_Turns': self.data.get('PPG_Turns', [])[segment],
+        }
+        if any(len(p) == 0 for p in peaks_dict.values()):
+            self.quality_label.setText("信号质量：不合格（缺少特征点）")
+        else:
+            quality_pass = check_ppg_quality(peaks_dict)
+            self.quality_label.setText("信号质量：合格" if quality_pass else "信号质量：不合格")
+
+        # 這裡把原先的 autoencoder reconstruction error 改成「ECG anomaly score」
+        #檢查ECG_RealPeaks的間距(以及跟邊界的距離)，大於3秒(375個採樣點)，則判定為異常，小於0.5秒(約63個採樣點)，則判定為異常
+        max_distance_threshold = 375
+        min_distance_threshold = 63
+        extend_boundary = self.data['ECG_RPeaks'][segment] 
+        extend_boundary = np.array([0, *extend_boundary, 1249])
+        diff = np.diff(extend_boundary)
+        print(f"diff: {diff}, length: {len(diff)}")
+        diff2 = diff[1:-1]
+
+        info_text = ""
+        # 計算 ECG anomaly score (DTW)
+        ecg_anomaly_score = self.compute_ecg_dtw_score(segment)
+        if ecg_anomaly_score is not None:
+            threshold = 3.0   # 這個閾值可自行調整
+            status = "正常" if ecg_anomaly_score < threshold and len(self.data['ECG_RPeaks'][segment]) > 4 and np.all(diff < max_distance_threshold) and np.all(diff2 > min_distance_threshold) else "異常"
+            info_text += f"\nECG 異常分數(平均DTW): {ecg_anomaly_score:.2f}\n"
+            info_text += f"判定: {status}\n"
+            self.anomaly_score_label.setText(f"Anomaly Score: {ecg_anomaly_score:.2f}")
+        else:
+            self.anomaly_score_label.setText("Anomaly Score: N/A")
+
+        seg_sbp = self.data.get('SegSBP', [])[segment] if 'SegSBP' in self.data else "N/A"
+        seg_dbp = self.data.get('SegDBP', [])[segment] if 'SegDBP' in self.data else "N/A"
+        info_text += f"SegSBP: {seg_sbp}\nSegDBP: {seg_dbp}\n"
+
+        ppg_speaks = self.data.get('PPG_SPeaks', [])[segment]
+        ppg_turns = self.data.get('PPG_Turns', [])[segment]
+        ecg_realpeaks = self.data.get('ECG_RPeaks', [])[segment]
+        # 可以做各種時間差計算
+        info_text += "\n... (各種時間差、血壓資訊略)\n"
+
+
+
+        self.info_label.setText(info_text)
+
+        # 將上面訊息一併顯示在 analysis_text
+        analysis_text = f"Segment {segment} 分析結果\n"
+        analysis_text += "=" * 30 + "\n\n"
+        analysis_text += info_text
+        self.analysis_text.setText(analysis_text)
+
 
     def calculate_second_derivative(self, segment):
         total_segments = len(self.data['ABP_Raw'])
@@ -569,19 +615,6 @@ class PulseDBViewer(QMainWindow):
     def calculate_double_integrated(self, second_derivative):
         cutoff = 0.5  # 截止頻率
         return lowpass_filter(second_derivative, cutoff, 125)
-        # double_integrated = scipy.integrate.cumtrapz(scipy.integrate.cumtrapz(second_derivative, initial=0), initial=0)
-        # return double_integrated
-
-    # def calculate_anomaly_score(self):
-    #     if self.db_combo.currentText() != "training_set.npz" and 'ABP_Raw' in self.data and 'ABP_Turns' in self.data and 'ABP_SPeaks' in self.data:
-    #         segment = self.segment_slider.value()
-    #         data = self.data['ABP_Raw'][segment]
-    #         turns = self.data['ABP_Turns'][segment]
-    #         speaks = self.data['ABP_SPeaks'][segment]
-    #         anomaly_score = detect_anomaly_gui(data, turns, speaks)
-    #         self.anomaly_score_label.setText(f"Anomaly Score: {anomaly_score:.4f}")
-    #     else:
-    #         self.anomaly_score_label.setText("Anomaly Score: N/A")
 
     def plot_reconstruction_error(self, data):
         self.reconstruction_error_plot.clear()
@@ -804,6 +837,39 @@ class PulseDBViewer(QMainWindow):
                 real_peaks.append(right_idx)
         
         return np.array(real_peaks)
+
+    def calculate_time_differences(self, ppg_points, ecg_points, fs):
+        time_diffs = []
+        for ppg_idx in ppg_points:
+            # 找到小于 ppg_idx 的最大 ecg_idx
+            ecg_prior = ecg_points[ecg_points <= ppg_idx]
+            if len(ecg_prior) == 0:
+                continue  # 没有找到之前的 ECG_RealPeaks
+            ecg_idx = ecg_prior[-1]
+            time_diff = (ppg_idx - ecg_idx) / fs
+            time_diffs.append(time_diff)
+        return time_diffs
+
+    def calculate_reconstruction_error(self, segment_idx):
+        """計算指定片段的重構誤差"""
+        try:
+            # 獲取 ECG 數據
+            ecg_data = self.data['ECG_F'][segment_idx]
+            
+            # 直接轉換為 tensor
+            ecg_tensor = torch.FloatTensor(ecg_data).to(self.device)
+            ecg_tensor = ecg_tensor.view(1, 1, -1)  # 添加批次和通道維度
+            
+            # 計算重構誤差
+            with torch.no_grad():
+                reconstructed = self.ecg_model(ecg_tensor)
+                error = F.mse_loss(reconstructed, ecg_tensor).item()
+                
+            return error
+            
+        except Exception as e:
+            print(f"計算重構誤差失敗: {str(e)}")
+            return None
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

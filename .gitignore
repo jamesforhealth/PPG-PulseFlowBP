@@ -14,3 +14,5 @@ pulsedb_annotations
 *.sqlite3
 *.sql
 *npy
+
+PulseDB2_0/*

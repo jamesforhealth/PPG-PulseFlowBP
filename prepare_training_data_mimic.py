@@ -3,7 +3,7 @@ import h5py
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-
+from prepare_training_data_vitaldb import check_signal_quality
 def create_annotation_matrix(length, peaks_dict):
     """
     將不同類型的特徵點轉換為 one-hot 編碼矩陣(4類):
@@ -102,16 +102,24 @@ class MIMICDatasetPreparator:
                 if 'Subj_Wins' not in f:
                     print(f"[Warning] {file_path.name} => 'Subj_Wins' not found, skip.")
                     return None
-
+                print(f"f: {f.keys()}")
                 matdata = f['Subj_Wins']
-                
+                # input(f"matdata: {matdata}")
                 # 讀取個人資訊
                 personal_info = self.extract_personal_info(f)
-
+                print(f"matdata['ECG_F'][0]: {matdata['ECG_F'][0]}, type: {type(matdata['ECG_F'][0])}, len: {len(matdata['ECG_F'][0])}")
+                input(f"personal_info: {personal_info}")
                 # 檢查必要欄位
                 if 'PPG_F' not in matdata or 'ABP_Raw' not in matdata:
                     print(f"[Warning] {file_path.name} => PPG_F/ABP_Raw missing, skip.")
                     return None
+                ecg_f_list = []
+                for ref in matdata['ECG_F'][0]:
+                    try:
+                        arr = f[ref][()]
+                        ecg_f_list.append(arr.flatten())
+                    except:
+                        ecg_f_list.append(np.array([], dtype=float))
 
                 # 讀取 PPG_F
                 ppg_f_list = []
@@ -176,16 +184,23 @@ class MIMICDatasetPreparator:
                     if len(ppg_f_list[i]) != 1250:
                         continue
 
+                    # 檢查信號質量
+                        
+
                     peaks_dict = {
                         'ECG_RealPeaks': ecg_realpeaks_arr[i],
                         'PPG_SPeaks': ppg_speaks_arr[i],
                         'PPG_Turns': ppg_turns_arr[i]
                     }
+                    if not check_signal_quality(peaks_dict):
+                        continue
+
                     # 使用完整的 annotation matrix (4類)
                     ann_matrix = create_annotation_matrix(1250, peaks_dict)
 
                     data = {
                         'ppg': ppg_f_list[i],       # shape=(1250,)
+                        'ecg': ecg_f_list[i],       # shape=(1250,)
                         'annotations': ann_matrix,   # shape=(1250,4)
                         'segsbp': seg_sbp[i],
                         'segdbp': seg_dbp[i],
@@ -219,6 +234,7 @@ class MIMICDatasetPreparator:
         with h5py.File(output_path, 'w') as f_out:
             n_samples = len(all_data)
             f_out.create_dataset('ppg',          (n_samples, 1250),    dtype='float32')
+            f_out.create_dataset('ecg',          (n_samples, 1250),    dtype='float32')
             f_out.create_dataset('annotations',  (n_samples, 1250, 4), dtype='float32')  # 修正為4類
             f_out.create_dataset('segsbp',       (n_samples,),         dtype='float32')
             f_out.create_dataset('segdbp',       (n_samples,),         dtype='float32')
@@ -278,7 +294,7 @@ class MIMICDatasetPreparator:
 if __name__ == '__main__':
     preparator = MIMICDatasetPreparator(
         data_dir="PulseDB_MIMIC",
-        output_dir="training_data_1250_MIMIC",
+        output_dir="training_data_MIMIC",
         n_folds=10
     )
     preparator.create_folds()
