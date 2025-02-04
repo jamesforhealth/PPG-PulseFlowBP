@@ -70,7 +70,7 @@ class H5DataViewer(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
-        # 創建三個獨立的圖表
+        # 創建五個獨立的圖表
         # ECG 圖表
         self.ecg_plot = pg.PlotWidget()
         self.ecg_plot.setBackground('w')
@@ -87,6 +87,22 @@ class H5DataViewer(QMainWindow):
         self.ppg_plot.setLabel('left', 'Amplitude (a.u.)')
         right_layout.addWidget(self.ppg_plot, stretch=1)
         
+        # PPG 一階差分圖表
+        self.ppg_first_diff_plot = pg.PlotWidget()
+        self.ppg_first_diff_plot.setBackground('w')
+        self.ppg_first_diff_plot.showGrid(x=True, y=True)
+        self.ppg_first_diff_plot.setTitle("PPG First Derivative")
+        self.ppg_first_diff_plot.setLabel('left', 'Amplitude/dt')
+        right_layout.addWidget(self.ppg_first_diff_plot, stretch=1)
+        
+        # PPG 二階差分圖表
+        self.ppg_second_diff_plot = pg.PlotWidget()
+        self.ppg_second_diff_plot.setBackground('w')
+        self.ppg_second_diff_plot.showGrid(x=True, y=True)
+        self.ppg_second_diff_plot.setTitle("PPG Second Derivative")
+        self.ppg_second_diff_plot.setLabel('left', 'Amplitude/dt²')
+        right_layout.addWidget(self.ppg_second_diff_plot, stretch=1)
+        
         # ABP 圖表
         self.abp_plot = pg.PlotWidget()
         self.abp_plot.setBackground('w')
@@ -97,11 +113,14 @@ class H5DataViewer(QMainWindow):
         
         # 設置 X 軸鏈接
         self.ecg_plot.setXLink(self.ppg_plot)
-        self.ppg_plot.setXLink(self.abp_plot)
+        self.ppg_plot.setXLink(self.ppg_first_diff_plot)
+        self.ppg_first_diff_plot.setXLink(self.ppg_second_diff_plot)
+        self.ppg_second_diff_plot.setXLink(self.abp_plot)
         
-        # 添加局部放大功能
-        for plot in [self.ecg_plot, self.ppg_plot, self.abp_plot]:
-            plot.setMouseEnabled(x=True, y=True)  # 啟用鼠標縮放
+        # 為所有圖表添加局部放大功能
+        for plot in [self.ecg_plot, self.ppg_plot, self.ppg_first_diff_plot, 
+                    self.ppg_second_diff_plot, self.abp_plot]:
+            plot.setMouseEnabled(x=True, y=True)
             plot.enableAutoRange()
             plot.setAutoVisible(y=True)
             
@@ -112,7 +131,6 @@ class H5DataViewer(QMainWindow):
             plot.addItem(vLine, ignoreBounds=True)
             plot.addItem(hLine, ignoreBounds=True)
             
-            # 修正鼠標移動事件
             def mouseMoved(evt):
                 if plot.sceneBoundingRect().contains(evt):
                     mousePoint = plot.plotItem.vb.mapSceneToView(evt)
@@ -134,7 +152,7 @@ class H5DataViewer(QMainWindow):
     def update_file_list(self):
         """更新文件列表"""
         import glob
-        h5_files = glob.glob("training_data_VitalDB_quality/*.h5")
+        h5_files = glob.glob("personalized_training_data_VitalDB/*.h5")
         self.file_list.clear()
         for file in h5_files:
             self.file_list.addItem(file)
@@ -211,6 +229,8 @@ class H5DataViewer(QMainWindow):
         # 清除所有圖表
         self.ecg_plot.clear()
         self.ppg_plot.clear()
+        self.ppg_first_diff_plot.clear()
+        self.ppg_second_diff_plot.clear()
         self.abp_plot.clear()
         
         # 繪製信號
@@ -229,30 +249,55 @@ class H5DataViewer(QMainWindow):
                                  pen=None, symbol='o', symbolSize=5, 
                                  symbolBrush=(255,0,0))
         
-        # 繪製 PPG
+        # 繪製 PPG 及其差分
         if self.checkboxes['ppg'].isChecked() and 'ppg' in data:
-            self.ppg_plot.plot(x, data['ppg'], 
+            # 原始 PPG 信號
+            ppg_signal = data['ppg']
+            self.ppg_plot.plot(x, ppg_signal, 
                              pen=pg.mkPen(color=(255,0,0), width=1))
+            
+            # 計算並繪製一階差分
+            ppg_first_diff = np.zeros_like(ppg_signal)
+            # 內部點使用中心差分
+            ppg_first_diff[1:-1] = (ppg_signal[2:] - ppg_signal[:-2]) / 2
+            # 邊界點使用前向/後向差分
+            ppg_first_diff[0] = ppg_signal[1] - ppg_signal[0]
+            ppg_first_diff[-1] = ppg_signal[-1] - ppg_signal[-2]
+            
+            self.ppg_first_diff_plot.plot(x, ppg_first_diff,
+                                        pen=pg.mkPen(color=(0,0,180), width=2))
+            
+            # 計算並繪製二階差分
+            ppg_second_diff = np.zeros_like(ppg_signal)
+            # 內部點使用中心差分
+            ppg_second_diff[2:-2] = (ppg_signal[4:] - 2*ppg_signal[2:-2] + ppg_signal[:-4]) / 4
+            # 邊界點使用相鄰的內部點值
+            ppg_second_diff[0] = ppg_second_diff[2]
+            ppg_second_diff[1] = ppg_second_diff[2]
+            ppg_second_diff[-2] = ppg_second_diff[-3]
+            ppg_second_diff[-1] = ppg_second_diff[-3]
+            
+            self.ppg_second_diff_plot.plot(x, ppg_second_diff,
+                                         pen=pg.mkPen(color=(128,0,128), width=2))
+            
             # 添加 PPG 特徵點
             if 'annotations' in data:
-                # PPG peaks (第1列)
+                # PPG peaks
                 ppg_peaks = np.where(data['annotations'][:, 1] == 1)[0]
-                ppg_peak_values = data['ppg'][ppg_peaks]
+                ppg_peak_values = ppg_signal[ppg_peaks]
                 self.ppg_plot.plot(x[ppg_peaks], ppg_peak_values, 
                                  pen=None, symbol='o', symbolSize=5, 
-                                 symbolBrush=(0,255,0), 
-                                 name='PPG Peaks')
+                                 symbolBrush=(0,255,0))
                 
-                # PPG turns (第2列)
+                # PPG turns
                 ppg_turns = np.where(data['annotations'][:, 2] == 1)[0]
-                ppg_turn_values = data['ppg'][ppg_turns]
+                ppg_turn_values = ppg_signal[ppg_turns]
                 self.ppg_plot.plot(x[ppg_turns], ppg_turn_values,
                                  pen=None, symbol='s', symbolSize=5,
-                                 symbolBrush=(255,255,0),
-                                 name='PPG Turns')
-                
-                # 添加圖例
-                self.ppg_plot.addLegend()
+                                 symbolBrush=(255,128,0))
+            
+            # 添加圖例
+            self.ppg_plot.addLegend()
         
         # 繪製 ABP
         if self.checkboxes['abp'].isChecked() and 'abp' in data:
@@ -264,7 +309,8 @@ class H5DataViewer(QMainWindow):
             self.abp_plot.addLine(y=data['segdbp'], pen=pg.mkPen('b', style=Qt.DashLine))
         
         # 設置 X 軸標籤
-        for plot in [self.ecg_plot, self.ppg_plot, self.abp_plot]:
+        for plot in [self.ecg_plot, self.ppg_plot, self.ppg_first_diff_plot, 
+                    self.ppg_second_diff_plot, self.abp_plot]:
             plot.setLabel('bottom', 'Time (s)')
         
         # 更新分析文本

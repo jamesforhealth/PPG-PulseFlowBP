@@ -247,7 +247,7 @@ class ModelPPGECG(nn.Module):
     - 2路結果都做 self-attn => global avg
     - concat => personal info => final => (B,2)
     """
-    def __init__(self, info_dim=5, wave_out_ch=64, d_model=64, n_heads=4):
+    def __init__(self, info_dim=4, wave_out_ch=64, d_model=64, n_heads=4):
         super().__init__()
         self.ppg_unet = ResUNet1D(in_ch=1, out_ch=wave_out_ch)
         self.ecg_unet = ResUNet1D(in_ch=1, out_ch=wave_out_ch)
@@ -257,13 +257,14 @@ class ModelPPGECG(nn.Module):
 
         self.final_pool = nn.AdaptiveAvgPool1d(1)
 
+        # 將此處 info_dim 改為 4
         self.info_fc = nn.Sequential(
             nn.Linear(info_dim, 32),
             nn.ReLU()
         )
         # final fc => 2
         self.final_fc = nn.Sequential(
-            nn.Linear(wave_out_ch*2 +32, 64),
+            nn.Linear(wave_out_ch*2 + 32, 64),
             nn.ReLU(),
             nn.Linear(64, 2)
         )
@@ -271,13 +272,13 @@ class ModelPPGECG(nn.Module):
     def forward(self, ppg, ecg, personal_info):
         # ppg, ecg => (B,1,L)
         ppg_feat_map = self.ppg_unet(ppg)   # => (B,64,L)
-        ecg_feat_map = self.ecg_unet(ecg)   # => (B,64,L)
+        ecg_feat_map = self.ecg_unet(ecg)     # => (B,64,L)
 
         ppg_feat_map = self.self_attn_ppg(ppg_feat_map)  # => (B,64,L)
-        ecg_feat_map = self.self_attn_ecg(ecg_feat_map)  # => (B,64,L)
+        ecg_feat_map = self.self_attn_ecg(ecg_feat_map)    # => (B,64,L)
 
         ppg_feat = self.final_pool(ppg_feat_map).squeeze(-1) # (B,64)
-        ecg_feat = self.final_pool(ecg_feat_map).squeeze(-1) # (B,64)
+        ecg_feat = self.final_pool(ecg_feat_map).squeeze(-1)   # (B,64)
 
         info_feat = self.info_fc(personal_info)  # (B,32)
 
@@ -444,7 +445,7 @@ class BPTrainerCompare:
 
         # 2) PPG+ECG
         print("\n=== Training ModelPPGECG ===")
-        model_ppg_ecg = ModelPPGECG(info_dim=5, wave_out_ch=64, d_model=64, n_heads=4)
+        model_ppg_ecg = ModelPPGECG(info_dim=4, wave_out_ch=64, d_model=64, n_heads=4)
         total_params = sum(p.numel() for p in model_ppg_ecg.parameters())
         print(f"Total parameters: {total_params}")
         model_ppg_ecg = self.train_one_model(model_ppg_ecg, train_loader, val_loader)
@@ -701,7 +702,11 @@ class BPTrainerCompare3:
         return train_loader, val_loader, test_loader
 
     def train_model(self, model, train_loader, val_loader, epochs=50, early_stop_patience=10):
+        #device
+        print(f"Device={self.device}")
         model.to(self.device)
+        #sum of paran
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
         criterion= nn.MSELoss()
         optimizer= optim.Adam(model.parameters(), lr=self.lr, weight_decay=1e-4)
         scheduler= optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
@@ -769,6 +774,8 @@ class BPTrainerCompare3:
                 best_val= val_loss
                 pc=0
                 best_sd= model.state_dict()
+                #save model
+                torch.save(model.state_dict(), f"model_{model.__class__.__name__}.pth")
             else:
                 pc+=1
                 if pc>=early_stop_patience:
@@ -825,35 +832,34 @@ class BPTrainerCompare3:
         # print(f"[PPGOnlyNoInfo] Test MSE={loss_n:.4f}, MAE={mae_n:.4f}")
 
         # 2) ModelPPGOnly (前面有 personal_info)
-        print("\n=== Train ModelPPGOnly ===")
-        from __main__ import ModelPPGOnly  # 假設在同檔案可直接用
-        model_ppg_only= ModelPPGOnly(info_dim=5, wave_out_ch=64, d_model=64, n_heads=4)
-        model_ppg_only= self.train_model(model_ppg_only, train_loader, val_loader)
-        loss_o, mae_o= self.eval_model(model_ppg_only, test_loader)
-        print(f"[PPGOnly + Info] Test MSE={loss_o:.4f}, MAE={mae_o:.4f}")
+        # print("\n=== Train ModelPPGOnly ===")
+        # from __main__ import ModelPPGOnly  # 假設在同檔案可直接用
+        # model_ppg_only= ModelPPGOnly(info_dim=5, wave_out_ch=64, d_model=64, n_heads=4)
+        # model_ppg_only= self.train_model(model_ppg_only, train_loader, val_loader)
+        # loss_o, mae_o= self.eval_model(model_ppg_only, test_loader)
+        # print(f"[PPGOnly + Info] Test MSE={loss_o:.4f}, MAE={mae_o:.4f}")
 
         # 3) ModelPPGECG
         print("\n=== Train ModelPPGECG ===")
-        from __main__ import ModelPPGECG
-        model_ppg_ecg= ModelPPGECG(info_dim=5, wave_out_ch=64, d_model=64, n_heads=4)
+        model_ppg_ecg= ModelPPGECG(info_dim=4, wave_out_ch=32, d_model=32, n_heads=4)
         model_ppg_ecg= self.train_model(model_ppg_ecg, train_loader, val_loader)
         loss_e, mae_e= self.eval_model(model_ppg_ecg, test_loader)
         print(f"[PPG+ECG + Info] Test MSE={loss_e:.4f}, MAE={mae_e:.4f}")
 
-        print("\n=== Summary ===")
-        print(f"PPGOnlyNoInfo => MSE={loss_n:.4f}, MAE={mae_n:.4f}")
-        print(f"PPGOnly+Info  => MSE={loss_o:.4f}, MAE={mae_o:.4f}")
-        print(f"PPG+ECG+Info  => MSE={loss_e:.4f}, MAE={mae_e:.4f}")
+        # print("\n=== Summary ===")
+        # print(f"PPGOnlyNoInfo => MSE={loss_n:.4f}, MAE={mae_n:.4f}")
+        # print(f"PPGOnly+Info  => MSE={loss_o:.4f}, MAE={mae_o:.4f}")
+        # print(f"PPG+ECG+Info  => MSE={loss_e:.4f}, MAE={mae_e:.4f}")
 
 ############################################################
 # main
 ############################################################
 if __name__=='__main__':
-    fold_path='training_data_1250_MIMIC_test'  
+    fold_path='training_data_VitalDB_quality'  
     trainer= BPTrainerCompare3(
         fold_path=fold_path,
         device='cuda',
-        batch_size=32,
+        batch_size=64,
         lr=1e-3
     )
     trainer.run_all()

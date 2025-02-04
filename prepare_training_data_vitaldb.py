@@ -460,10 +460,10 @@ if __name__=="__main__":
     # 3) 第二步：依某個 fold 列表產生 HDF5
     #    例如要處理 training_1_files.txt -> training_1.h5
     # 同理:
-    # preparator.write_h5_from_file_list("training_data_VitalDB_quality/val_files.txt", "validation.h5")
-    # preparator.write_h5_from_file_list("training_data_VitalDB_quality/test_files.txt", "test.h5")
+    preparator.write_h5_from_file_list("training_data_VitalDB_quality/val_files.txt", "validation.h5")
+    preparator.write_h5_from_file_list("training_data_VitalDB_quality/test_files.txt", "test.h5")
 
-    for i in range(5,10):
+    for i in range(1,10):
         preparator.write_h5_from_file_list(
             file_list_txt=f"training_data_VitalDB_quality/training_{i}_files.txt",
             output_h5=f"training_{i}.h5"
