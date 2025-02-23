@@ -25,7 +25,7 @@ class VitalSignDatasetBasic(Dataset):
         super().__init__()
         self.h5 = h5py.File(h5_file, 'r')
         self.personal = self.h5['personal_info']        # (N,4)
-        self.vascular = self.h5['vascular_properties']  # (N,2)
+        self.vascular = self.h5['vascular_properties']  # (N,3)
         sbp = self.h5['segsbp'][:]                      # (N,)
         dbp = self.h5['segdbp'][:]
         self.labels = np.stack([sbp, dbp], axis=1)      # (N,2)
@@ -35,13 +35,13 @@ class VitalSignDatasetBasic(Dataset):
 
     def __getitem__(self, idx):
         pers = self.personal[idx]       # shape=(4,)
-        vasc = self.vascular[idx]       # shape=(2,)
+        vasc = self.vascular[idx]       # shape=(3,)
         label= self.labels[idx]         # shape=(2,)
         return pers, vasc, label
 
 def load_basic_data_for_sklearn(dataset):
     """
-    將 dataset 轉成 X=(N,6), y=(N,2) for sklearn
+    將 dataset 轉成 X=(N,7), y=(N,2) for sklearn
     """
     X_list = []
     y_list = []
@@ -56,10 +56,10 @@ def load_basic_data_for_sklearn(dataset):
         X_list.append(X_feat)
         y_list.append(lab)
     
-    X_arr = np.array(X_list)      # (N,6)
+    X_arr = np.array(X_list)      # (N,7)
     y_arr = np.array(y_list)      # (N,2)
     pers_arr = np.array(pers_list)  # (N,4)
-    vasc_arr = np.array(vasc_list)  # (N,2)
+    vasc_arr = np.array(vasc_list)  # (N,3)
     
     return X_arr, y_arr, pers_arr, vasc_arr
 
@@ -242,7 +242,7 @@ def analyze_models_and_depths(train_dataset, val_dataset):
 
 if __name__=='__main__':
     # 設定特徵名稱
-    feature_names = ['Age', 'Gender', 'Height', 'Weight', 'PTT', 'PAT']
+    feature_names = ['Age', 'Gender', 'Height', 'Weight', 'PTT', 'PAT', 'HR']
     
     # 載入數據
     data_dir = Path('training_data_VitalDB_quality')

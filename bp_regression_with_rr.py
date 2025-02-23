@@ -11,7 +11,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.preprocessing import MinMaxScaler
+#from sklearn.model_selection import train_test_split  # 不再用此方法
+
 # xgboost
 import xgboost as xgb
 
@@ -115,8 +116,7 @@ def train_and_eval_regressors(X_train, y_train, X_test, y_test, model_name="SBP"
 
     # 3) XGBoost
     logger.info("3/4 訓練 XGBoost...")
-    xgbr = xgb.XGBRegressor(n_estimators=100, random_state=42,
-                             use_label_encoder=False, eval_metric='rmse')
+    xgbr = xgb.XGBRegressor(n_estimators=100, random_state=42, use_label_encoder=False, eval_metric='rmse')
     xgbr.fit(X_train, y_train)
     pred_xgb = xgbr.predict(X_test)
     mae_xgb = mean_absolute_error(y_test, pred_xgb)
@@ -143,8 +143,8 @@ def main():
     """
     主流程：
       1. 從指定資料夾中讀取訓練資料（training_*.h5）用於模型訓練
-      2. 從 validation.h5 與 test.h5 讀取測試資料（這兩個檔案來自不同的受試者）
-      3. 特徵包含：個人資訊 (4 維) 與 vascular_properties (3 維)，總共 7 維
+      2. 從 validation.h5 與 test.h5 讀取測試資料（來自不同受試者）
+      3. 選擇特徵：個人資訊 (4 維) 與 vascular_properties (3 維)，總共 7 維特徵
       4. 分別針對 SBP 與 DBP 執行回歸模型訓練與評估
     """
     data_dir = Path('training_data_VitalDB_quality')
@@ -161,7 +161,7 @@ def main():
         return
     logger.info(f"訓練資料集共 {len(df_train)} 筆, 欄位: {df_train.columns.tolist()}")
 
-    # 2. 載入測試資料：validation.h5 與 test.h5
+    # 2. 載入測試資料：validation.h5 與 test.h5（來自不同受試者）
     test_files = []
     val_file = data_dir / 'validation.h5'
     test_file = data_dir / 'test.h5'
@@ -179,7 +179,7 @@ def main():
         return
     logger.info(f"測試資料集共 {len(df_test)} 筆, 欄位: {df_test.columns.tolist()}")
 
-    # 3. 定義特徵與標籤：
+    # 3. 定義特徵與標籤：  
     # 特徵包含：個人資訊 (age, gender, weight, height) 與 vascular_properties (ptt, pat, rr_interval)
     feature_cols = ['age', 'gender', 'weight', 'height', 'ptt', 'pat', 'rr_interval']
     X_train = df_train[feature_cols].values
@@ -192,18 +192,12 @@ def main():
 
     logger.info(f"訓練集大小: {len(X_train)}，測試集大小: {len(X_test)}")
 
-    # 4. 對特徵進行縮放（MinMax Scaling），將各個特徵壓縮到 0~1 區間
-    scaler = MinMaxScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    logger.info("完成特徵縮放 (MinMaxScaler)")
-
-    # 5. 分別訓練並評估 SBP 與 DBP 模型
+    # 4. 分別訓練並評估 SBP 與 DBP 模型
     logger.info("\n===== SBP 回歸 =====")
-    _ = train_and_eval_regressors(X_train_scaled, y_sbp_train, X_test_scaled, y_sbp_test, model_name="SBP")
+    _ = train_and_eval_regressors(X_train, y_sbp_train, X_test, y_sbp_test, model_name="SBP")
 
     logger.info("\n===== DBP 回歸 =====")
-    _ = train_and_eval_regressors(X_train_scaled, y_dbp_train, X_test_scaled, y_dbp_test, model_name="DBP")
+    _ = train_and_eval_regressors(X_train, y_dbp_train, X_test, y_dbp_test, model_name="DBP")
 
 
 if __name__ == "__main__":

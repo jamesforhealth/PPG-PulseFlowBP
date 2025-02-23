@@ -273,7 +273,7 @@ class PulseDBViewer(QMainWindow):
             self.data = {}
             
             for key in matdata.keys():
-                # print(f"\nProcessing key: {key}")
+                print(f"\nProcessing key: {key}")
                 try:
                     if key in ['ABP_Raw', 'ABP_F', 'ECG_Raw', 'ECG_F', 'PPG_Raw', 'PPG_F']:
                         self.data[key] = []
@@ -293,7 +293,8 @@ class PulseDBViewer(QMainWindow):
                         self.data[key] = []
                         for i, ref in enumerate(matdata[key][0]):
                             value = f[ref][()]
-                            # print(f"  {key} value {i}: {value}")
+                            if key == 'CaseID' or key == 'WinID' or key == 'WinSeqID':
+                                print(f"  {key} value {i}: {value}")
                             if isinstance(value, np.ndarray):
                                 value = value.squeeze()
                                 if value.size == 1:

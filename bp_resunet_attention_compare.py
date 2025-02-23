@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import h5py
 import numpy as np
 from pathlib import Path
@@ -13,30 +13,38 @@ import os
 ############################################################
 class BPDataset(Dataset):
     """
-    讀取 .h5 (含 ppg, ecg, segsbp, segdbp, personal_info)
-    預期 shape:
-      ppg: (N, 1250)
-      ecg: (N, 1250)
-      segsbp: (N,) or (N,1)
-      segdbp: (N,) or (N,1)
-      personal_info: (N, M)  e.g. M=5
+    從 .h5 中讀取:
+      - ppg: (N,1250)
+      - ecg: (N,1250) 若不存在，則以 zeros 取代
+      - segsbp, segdbp: (N,)
+      - personal_info: (N, M) 若不存在，則以 zeros 填充 (預設 M=5)
+      - vascular_properties: (N,3) 若不存在，則以 zeros 填充 (假設 3 維)
     """
     def __init__(self, h5_path):
         super().__init__()
         self.h5_path = Path(h5_path)
         with h5py.File(self.h5_path, 'r') as f:
-            self.ppg = torch.from_numpy(f['ppg'][:])       # (N,1250)
-            self.ecg = torch.from_numpy(f['ecg'][:])       # (N,1250)
-            self.sbp = torch.from_numpy(f['segsbp'][:])    # (N,)
+            self.ppg = torch.from_numpy(f['ppg'][:])  # (N,1250)
+            if 'ecg' in f:
+                self.ecg = torch.from_numpy(f['ecg'][:])
+            else:
+                self.ecg = torch.zeros_like(self.ppg)
+            self.sbp = torch.from_numpy(f['segsbp'][:])
             self.dbp = torch.from_numpy(f['segdbp'][:])
             if 'personal_info' in f:
-                self.personal_info = torch.from_numpy(f['personal_info'][:])  # (N,M)
+                self.personal_info = torch.from_numpy(f['personal_info'][:])
             else:
-                n_samples = self.ppg.shape[0]
-                self.personal_info = torch.zeros(n_samples, 5)  # 預設 5 維
+                n = self.ppg.shape[0]
+                self.personal_info = torch.zeros((n,5))
+            if 'vascular_properties' in f:
+                self.vascular = torch.from_numpy(f['vascular_properties'][:])
+            else:
+                n = self.ppg.shape[0]
+                self.vascular = torch.zeros((n,3))
         # reshape => (N,1,1250)
         self.ppg = self.ppg.unsqueeze(1)
         self.ecg = self.ecg.unsqueeze(1)
+        # 組成 bp tensor shape=(N,2)
         self.bp_2d = torch.stack([self.sbp, self.dbp], dim=1)
 
     def __len__(self):
@@ -44,40 +52,32 @@ class BPDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'ppg': self.ppg[idx],             # shape=(1,1250)
-            'ecg': self.ecg[idx],             # shape=(1,1250)
-            'bp_values': self.bp_2d[idx],     # (2,)
-            'personal_info': self.personal_info[idx]  # (5,)
+            'ppg': self.ppg[idx],                   # shape=(1,1250)
+            'ecg': self.ecg[idx],                   # shape=(1,1250)
+            'bp_values': self.bp_2d[idx],           # shape=(2,)
+            'personal_info': self.personal_info[idx],  # shape=(M,)
+            'vascular': self.vascular[idx]          # shape=(3,)
         }
-
 
 ############################################################
 # 1) 一個簡易 ResUNet1D
 ############################################################
 class ConvBlock1D(nn.Module):
-    """
-    基本 conv + bn + relu
-    """
     def __init__(self, in_ch, out_ch, kernel_size=3):
         super().__init__()
         pad = kernel_size // 2
         self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad, bias=False)
         self.bn   = nn.BatchNorm1d(out_ch)
         self.act  = nn.ReLU(inplace=True)
-
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
 
 class DownBlock(nn.Module):
-    """
-    下採樣 => conv => conv
-    """
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.pool = nn.MaxPool1d(2)
         self.conv1 = ConvBlock1D(in_ch, out_ch, 3)
         self.conv2 = ConvBlock1D(out_ch, out_ch, 3)
-
     def forward(self, x):
         x = self.pool(x)
         x = self.conv1(x)
@@ -85,26 +85,18 @@ class DownBlock(nn.Module):
         return x
 
 class UpBlock(nn.Module):
-    """
-    上採樣 => conv transpose => concat => conv => conv
-    """
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.upconv = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=2, stride=2, bias=False)
         self.conv1 = ConvBlock1D(out_ch*2, out_ch, 3)
         self.conv2 = ConvBlock1D(out_ch, out_ch, 3)
-
     def forward(self, x, skip):
-        """
-        x: encoder流過來的(較小feature)
-        skip: encoder對應層(較大feature), 要skip connection
-        """
         x = self.upconv(x)
-        # concat
+        # 對齊長度
         diff = skip.shape[-1] - x.shape[-1]
-        if diff>0:  # 可能長度對不齊, 簡單 crop or pad
-            skip = skip[..., :-diff]
-        elif diff<0:
+        if diff > 0:
+            skip = skip[..., :x.shape[-1]]
+        elif diff < 0:
             x = x[..., :skip.shape[-1]]
         x = torch.cat([skip, x], dim=1)
         x = self.conv1(x)
@@ -112,16 +104,14 @@ class UpBlock(nn.Module):
         return x
 
 class ResUNet1D(nn.Module):
-    def __init__(self, in_ch=1, out_ch=64):
+    def __init__(self, in_ch=1, out_ch=64, base_ch=16):
         """
-        統一參數命名:
-        in_ch: 輸入通道數 (預設=1)
-        out_ch: 輸出通道數 (預設=64)
+        in_ch: 輸入通道 (預設=1)
+        out_ch: 最後輸出通道 (例如用於 feature map)
+        base_ch: 基礎通道數 (可根據需求調整)
         """
         super().__init__()
-        base_ch = 16  # 基礎通道數
-        
-        # encoder
+        # Encoder
         self.enc_conv1 = nn.Sequential(
             ConvBlock1D(in_ch, base_ch, 3),
             ConvBlock1D(base_ch, base_ch, 3)
@@ -129,39 +119,29 @@ class ResUNet1D(nn.Module):
         self.down1 = DownBlock(base_ch, base_ch*2)
         self.down2 = DownBlock(base_ch*2, base_ch*4)
         self.down3 = DownBlock(base_ch*4, base_ch*8)
-        
-        # bottleneck
+        # Bottleneck
         self.bottleneck = nn.Sequential(
             ConvBlock1D(base_ch*8, base_ch*8, 3),
             ConvBlock1D(base_ch*8, base_ch*8, 3)
         )
-        
-        # decoder
+        # Decoder
         self.up1 = UpBlock(base_ch*8, base_ch*4)
         self.up2 = UpBlock(base_ch*4, base_ch*2)
         self.up3 = UpBlock(base_ch*2, base_ch)
-        
-        # final conv to match desired output channels
+        # Final conv
         self.final = nn.Conv1d(base_ch, out_ch, kernel_size=1, bias=False)
-        
     def forward(self, x):
-        # encoder
-        c1 = self.enc_conv1(x)     # (B,16,L)
-        c2 = self.down1(c1)        # (B,32,L/2)
-        c3 = self.down2(c2)        # (B,64,L/4)
-        c4 = self.down3(c3)        # (B,128,L/8)
-        
-        # bottleneck
-        b = self.bottleneck(c4)    # (B,128,L/8)
-        
-        # decoder
-        d1 = self.up1(b, c3)       # (B,64,L/4)
-        d2 = self.up2(d1, c2)      # (B,32,L/2)
-        d3 = self.up3(d2, c1)      # (B,16,L)
-        
-        # final conv
-        out = self.final(d3)       # (B,out_ch,L)
+        c1 = self.enc_conv1(x)    # (B, base_ch, L)
+        c2 = self.down1(c1)       # (B, base_ch*2, L/2)
+        c3 = self.down2(c2)       # (B, base_ch*4, L/4)
+        c4 = self.down3(c3)       # (B, base_ch*8, L/8)
+        b = self.bottleneck(c4)   # (B, base_ch*8, L/8)
+        d1 = self.up1(b, c3)      # (B, base_ch*4, L/4)
+        d2 = self.up2(d1, c2)     # (B, base_ch*2, L/2)
+        d3 = self.up3(d2, c1)     # (B, base_ch, L)
+        out = self.final(d3)      # (B, out_ch, L)
         return out
+
 
 ############################################################
 # 2) Self-Attention 1D
@@ -243,47 +223,50 @@ class ModelPPGOnly(nn.Module):
 
 class ModelPPGECG(nn.Module):
     """
-    - 2路 ResUNet1D 分別處理 ppg, ecg
-    - 2路結果都做 self-attn => global avg
-    - concat => personal info => final => (B,2)
+    模型架構：
+      - 分別用 ResUNet1D 處理 ppg 與 ecg 信號
+      - 各自經 self-attention 及 global average pooling 得到特徵向量 (B, wave_out_ch)
+      - 個人資訊經 info_fc 處理成 (B, 32)
+      - vascular_properties 經 vasc_fc 處理成 (B, 32)
+      - 將上述特徵串接後 (B, 2*wave_out_ch + 64)，再經全連接層預測血壓 (2 維: [SBP, DBP])
     """
-    def __init__(self, info_dim=4, wave_out_ch=64, d_model=64, n_heads=4):
+    def __init__(self, info_dim=4, vascular_dim=3, wave_out_ch=64, d_model=64, n_heads=4):
         super().__init__()
         self.ppg_unet = ResUNet1D(in_ch=1, out_ch=wave_out_ch)
         self.ecg_unet = ResUNet1D(in_ch=1, out_ch=wave_out_ch)
-
         self.self_attn_ppg = MultiHeadSelfAttn1D(d_model=d_model, n_heads=n_heads)
         self.self_attn_ecg = MultiHeadSelfAttn1D(d_model=d_model, n_heads=n_heads)
-
         self.final_pool = nn.AdaptiveAvgPool1d(1)
-
-        # 將此處 info_dim 改為 4
+        # personal info 處理
         self.info_fc = nn.Sequential(
             nn.Linear(info_dim, 32),
             nn.ReLU()
         )
-        # final fc => 2
+        # vascular_properties 處理
+        self.vasc_fc = nn.Sequential(
+            nn.Linear(vascular_dim, 32),
+            nn.ReLU()
+        )
+        # 最終全連接層：輸入維度 = wave_out_ch*2 + 32 + 32
         self.final_fc = nn.Sequential(
-            nn.Linear(wave_out_ch*2 + 32, 64),
+            nn.Linear(wave_out_ch*2 + 64, 64),
             nn.ReLU(),
             nn.Linear(64, 2)
         )
-
-    def forward(self, ppg, ecg, personal_info):
-        # ppg, ecg => (B,1,L)
-        ppg_feat_map = self.ppg_unet(ppg)   # => (B,64,L)
-        ecg_feat_map = self.ecg_unet(ecg)     # => (B,64,L)
-
-        ppg_feat_map = self.self_attn_ppg(ppg_feat_map)  # => (B,64,L)
-        ecg_feat_map = self.self_attn_ecg(ecg_feat_map)    # => (B,64,L)
-
-        ppg_feat = self.final_pool(ppg_feat_map).squeeze(-1) # (B,64)
-        ecg_feat = self.final_pool(ecg_feat_map).squeeze(-1)   # (B,64)
-
-        info_feat = self.info_fc(personal_info)  # (B,32)
-
-        combined = torch.cat([ppg_feat, ecg_feat, info_feat], dim=1)  # (B,64+64+32)
-        out = self.final_fc(combined)  # => (B,2)
+    def forward(self, ppg, ecg, personal_info, vascular):
+        # 處理 ppg 與 ecg 信號
+        ppg_feat_map = self.ppg_unet(ppg)    # (B, wave_out_ch, L)
+        ecg_feat_map = self.ecg_unet(ecg)      # (B, wave_out_ch, L)
+        ppg_feat_map = self.self_attn_ppg(ppg_feat_map)  # (B, wave_out_ch, L)
+        ecg_feat_map = self.self_attn_ecg(ecg_feat_map)    # (B, wave_out_ch, L)
+        ppg_feat = self.final_pool(ppg_feat_map).squeeze(-1)  # (B, wave_out_ch)
+        ecg_feat = self.final_pool(ecg_feat_map).squeeze(-1)  # (B, wave_out_ch)
+        # 個人資訊與 vascular_properties 分別處理
+        info_feat = self.info_fc(personal_info)   # (B, 32)
+        vasc_feat = self.vasc_fc(vascular)         # (B, 32)
+        # 串接所有特徵
+        combined = torch.cat([ppg_feat, ecg_feat, info_feat, vasc_feat], dim=1)  # (B, wave_out_ch*2 + 64)
+        out = self.final_fc(combined)  # (B,2)
         return out
 
 ############################################################
@@ -473,48 +456,6 @@ class BPTrainerCompare:
 ########################################
 #  1) Dataset (同樣保留 BPDataset)
 ########################################
-class BPDataset(Dataset):
-    """
-    與前面相同，從 .h5 中讀取:
-      ppg: (N,1250)
-      ecg: (N,1250) (可能用不到)
-      segsbp, segdbp: (N,)
-      personal_info: (N,M) (可能用不到)
-    """
-    def __init__(self, h5_path):
-        super().__init__()
-        self.h5_path = Path(h5_path)
-        with h5py.File(self.h5_path, 'r') as f:
-            self.ppg = torch.from_numpy(f['ppg'][:])  # (N,1250)
-            if 'ecg' in f:
-                self.ecg = torch.from_numpy(f['ecg'][:])
-            else:
-                # 若檔案沒ecg, 也可做 placeholder
-                self.ecg = torch.zeros_like(self.ppg)
-            self.sbp = torch.from_numpy(f['segsbp'][:])
-            self.dbp = torch.from_numpy(f['segdbp'][:])
-            if 'personal_info' in f:
-                self.personal_info = torch.from_numpy(f['personal_info'][:])
-            else:
-                # 預設 0 or shape=(N,5)
-                n = self.ppg.shape[0]
-                self.personal_info = torch.zeros((n,5))
-
-        # reshape => (N,1,1250)
-        self.ppg = self.ppg.unsqueeze(1)
-        self.ecg = self.ecg.unsqueeze(1)
-        self.bp_2d = torch.stack([self.sbp, self.dbp], dim=1)  # (N,2)
-
-    def __len__(self):
-        return len(self.ppg)
-
-    def __getitem__(self, idx):
-        return {
-            'ppg': self.ppg[idx],  # (1,1250)
-            'ecg': self.ecg[idx],  # (1,1250)
-            'bp_values': self.bp_2d[idx],      # (2,)
-            'personal_info': self.personal_info[idx] # (M,)
-        }
 
 ########################################
 #  2) ResUNet1D (可再加深加寬)
@@ -604,26 +545,22 @@ class UpBlock(nn.Module):
 # 3) MultiHeadSelfAttn1D
 ########################################
 class MultiHeadSelfAttn1D(nn.Module):
-    def __init__(self, d_model=32, n_heads=4):
+    def __init__(self, d_model=64, n_heads=4):
         super().__init__()
-        self.n_heads= n_heads
-        self.d_model= d_model
-        self.mha= nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.ln= nn.LayerNorm(d_model)
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.mha = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln = nn.LayerNorm(d_model)
     def forward(self, x):
-        """
-        x: (B, C, L), C==d_model
-        return => (B, C, L)
-        """
-        B,C,L= x.shape
-        if C!= self.d_model:
-            raise ValueError(f"Attn expects C={self.d_model}, got {C}")
-        x_t= x.transpose(1,2) # => (B,L,C)
-        out,_= self.mha(x_t,x_t,x_t)
-        out= self.ln(out)     # => (B,L,C)
-        out= out.transpose(1,2)
+        # x: (B, C, L) ，要求 C == d_model
+        B, C, L = x.shape
+        if C != self.d_model:
+            raise ValueError(f"MultiHeadSelfAttn1D expects channel {self.d_model}, got {C}")
+        x_t = x.transpose(1,2)  # (B, L, C)
+        out, _ = self.mha(x_t, x_t, x_t)
+        out = self.ln(out)      # (B, L, C)
+        out = out.transpose(1,2)  # (B, C, L)
         return out
-
 ########################################
 # 4) Model: PPGOnlyNoInfo
 ########################################
@@ -673,183 +610,146 @@ class ModelPPGOnlyNoInfo(nn.Module):
 #########################################################
 class BPTrainerCompare3:
     """
-    1) ModelPPGOnlyNoInfo => ppg only
-    2) ModelPPGOnly => ppg + personal_info
-    3) ModelPPGECG => ppg + ecg + personal_info
+    比較三種模型：
+      1) ModelPPGOnlyNoInfo (僅用 ppg)
+      2) ModelPPGOnly (用 ppg 與 personal_info)
+      3) ModelPPGECG (用 ppg、ecg、personal_info 以及 vascular_properties)
+      
+    本範例著重修改 ModelPPGECG，使其納入 vascular_properties
     """
     def __init__(self, fold_path, device='cuda', batch_size=32, lr=1e-3):
         self.fold_path = Path(fold_path)
         self.device = torch.device(device)
-        self.batch_size= batch_size
-        self.lr= lr
+        self.batch_size = batch_size
+        self.lr = lr
 
     def create_dataloaders(self):
-        # 跟前例類似
-        train_files= [self.fold_path/f"training_{i}.h5" for i in range(1,10)]
-        from torch.utils.data import ConcatDataset
-        ds_list= []
+        train_files = [self.fold_path / f"training_{i}.h5" for i in range(1,10)]
+        ds_list = []
         for tf in train_files:
             if tf.exists():
                 ds_list.append(BPDataset(tf))
-        train_ds= ConcatDataset(ds_list)
-
-        val_ds= BPDataset(self.fold_path/'validation.h5')
-        test_ds= BPDataset(self.fold_path/'test.h5')
-
-        train_loader= DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, drop_last=True)
-        val_loader  = DataLoader(val_ds,batch_size=self.batch_size, shuffle=False, drop_last=False)
-        test_loader = DataLoader(test_ds,batch_size=self.batch_size, shuffle=False, drop_last=False)
+        train_ds = ConcatDataset(ds_list)
+        val_ds = BPDataset(self.fold_path / 'validation.h5')
+        test_ds = BPDataset(self.fold_path / 'test.h5')
+        train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, drop_last=False)
+        test_loader = DataLoader(test_ds, batch_size=self.batch_size, shuffle=False, drop_last=False)
         return train_loader, val_loader, test_loader
-
     def train_model(self, model, train_loader, val_loader, epochs=50, early_stop_patience=10):
-        #device
         print(f"Device={self.device}")
         model.to(self.device)
-        #sum of paran
         print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-        criterion= nn.MSELoss()
-        optimizer= optim.Adam(model.parameters(), lr=self.lr, weight_decay=1e-4)
-        scheduler= optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
-
-        best_val= float('inf')
-        best_sd= None
-        pc=0
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=self.lr, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
+        best_val = float('inf')
+        best_sd = None
+        patience_count = 0
         for ep in tqdm(range(1, epochs+1)):
             model.train()
-            run_loss=0.0
-            run_mae=0.0
+            run_loss = 0.0
+            run_mae = 0.0
             for batch in tqdm(train_loader):
-                ppg= batch['ppg'].to(self.device)       # (B,1,1250)
-                ecg= batch['ecg'].to(self.device)       # (B,1,1250)
+                ppg = batch['ppg'].to(self.device)
+                ecg = batch['ecg'].to(self.device)
                 bp = batch['bp_values'].float().to(self.device)
-                info= batch['personal_info'].float().to(self.device)
-
+                info = batch['personal_info'].float().to(self.device)
+                vascular = batch['vascular'].float().to(self.device)
                 optimizer.zero_grad()
-
-                # 判斷 model 類型
-                if isinstance(model, ModelPPGOnlyNoInfo):
-                    preds= model(ppg)
-                elif isinstance(model, ModelPPGOnly):
-                    preds= model(ppg, info)
+                # 依模型不同呼叫 forward
+                # 假設若模型不是 ModelPPGOnlyNoInfo 或 ModelPPGOnly 則為 ModelPPGECG
+                if hasattr(model, 'ppg_unet') and hasattr(model, 'ecg_unet') and hasattr(model, 'vasc_fc'):
+                    preds = model(ppg, ecg, info, vascular)
+                elif hasattr(model, 'ppg_unet') and hasattr(model, 'info_fc'):
+                    preds = model(ppg, info)
                 else:
-                    # ModelPPGECG
-                    preds= model(ppg, ecg, info)
-
-                loss= criterion(preds, bp)
+                    preds = model(ppg)
+                loss = criterion(preds, bp)
                 mae = (preds - bp).abs().mean()
                 loss.backward()
                 optimizer.step()
-                run_loss+= loss.item()
+                run_loss += loss.item()
                 run_mae += mae.item()
-
-            train_loss= run_loss/len(train_loader)
-            train_mae = run_mae /len(train_loader)
-
-            # val
+            train_loss = run_loss / len(train_loader)
+            train_mae = run_mae / len(train_loader)
+            # validation
             model.eval()
-            val_l=0.0
-            val_m=0.0
+            val_loss_sum = 0.0
+            val_mae_sum = 0.0
             with torch.no_grad():
-                for batch in val_loader:
-                    ppg= batch['ppg'].to(self.device)
-                    ecg= batch['ecg'].to(self.device)
+                for batch in tqdm(val_loader):
+                    ppg = batch['ppg'].to(self.device)
+                    ecg = batch['ecg'].to(self.device)
                     bp = batch['bp_values'].float().to(self.device)
-                    info= batch['personal_info'].float().to(self.device)
-                    if isinstance(model, ModelPPGOnlyNoInfo):
-                        preds= model(ppg)
-                    elif isinstance(model, ModelPPGOnly):
-                        preds= model(ppg, info)
+                    info = batch['personal_info'].float().to(self.device)
+                    vascular = batch['vascular'].float().to(self.device)
+                    if hasattr(model, 'ppg_unet') and hasattr(model, 'ecg_unet') and hasattr(model, 'vasc_fc'):
+                        preds = model(ppg, ecg, info, vascular)
+                    elif hasattr(model, 'ppg_unet') and hasattr(model, 'info_fc'):
+                        preds = model(ppg, info)
                     else:
-                        preds= model(ppg, ecg, info)
-                    l= criterion(preds,bp)
-                    m= (preds - bp).abs().mean()
-                    val_l+= l.item()
-                    val_m+= m.item()
-
-            val_loss= val_l/len(val_loader)
-            val_mae = val_m/len(val_loader)
+                        preds = model(ppg)
+                    l = criterion(preds, bp)
+                    m = (preds - bp).abs().mean()
+                    val_loss_sum += l.item()
+                    val_mae_sum += m.item()
+            val_loss = val_loss_sum / len(val_loader)
+            val_mae = val_mae_sum / len(val_loader)
             scheduler.step(val_loss)
-
-            if val_loss<best_val:
-                best_val= val_loss
-                pc=0
-                best_sd= model.state_dict()
-                #save model
+            if val_loss < best_val:
+                best_val = val_loss
+                patience_count = 0
+                best_sd = model.state_dict()
                 torch.save(model.state_dict(), f"model_{model.__class__.__name__}.pth")
             else:
-                pc+=1
-                if pc>=early_stop_patience:
+                patience_count += 1
+                if patience_count >= early_stop_patience:
                     print(f"[EarlyStop] epoch={ep}")
                     break
-
-            print(f"[Epoch {ep}/{epochs}] TrainLoss={train_loss:.4f},MAE={train_mae:.4f} | "
-                  f"ValLoss={val_loss:.4f},MAE={val_mae:.4f}")
-
+            print(f"[Epoch {ep}/{epochs}] TrainLoss={train_loss:.4f}, MAE={train_mae:.4f} | ValLoss={val_loss:.4f}, MAE={val_mae:.4f}")
         if best_sd is not None:
             model.load_state_dict(best_sd)
         return model
 
     def eval_model(self, model, test_loader):
         model.eval()
-        criterion= nn.MSELoss()
-        run_l=0.0
-        run_m=0.0
-        n_batch=0
+        criterion = nn.MSELoss()
+        run_loss = 0.0
+        run_mae = 0.0
+        count = 0
         with torch.no_grad():
             for batch in test_loader:
-                ppg= batch['ppg'].to(self.device)
-                ecg= batch['ecg'].to(self.device)
+                ppg = batch['ppg'].to(self.device)
+                ecg = batch['ecg'].to(self.device)
                 bp = batch['bp_values'].float().to(self.device)
-                info= batch['personal_info'].float().to(self.device)
-
-                if isinstance(model, ModelPPGOnlyNoInfo):
-                    preds= model(ppg)
-                elif isinstance(model, ModelPPGOnly):
-                    preds= model(ppg, info)
+                info = batch['personal_info'].float().to(self.device)
+                vascular = batch['vascular'].float().to(self.device)
+                if hasattr(model, 'ppg_unet') and hasattr(model, 'ecg_unet') and hasattr(model, 'vasc_fc'):
+                    preds = model(ppg, ecg, info, vascular)
+                elif hasattr(model, 'ppg_unet') and hasattr(model, 'info_fc'):
+                    preds = model(ppg, info)
                 else:
-                    preds= model(ppg, ecg, info)
-
-                l= criterion(preds, bp)
-                m= (preds - bp).abs().mean()
-                run_l+= l.item()
-                run_m+= m.item()
-                n_batch+=1
-        test_loss= run_l/n_batch
-        test_mae = run_m/n_batch
+                    preds = model(ppg)
+                l = criterion(preds, bp)
+                m = (preds - bp).abs().mean()
+                run_loss += l.item()
+                run_mae += m.item()
+                count += 1
+        test_loss = run_loss / count
+        test_mae = run_mae / count
         return test_loss, test_mae
 
     def run_all(self):
-        train_loader, val_loader, test_loader= self.create_dataloaders()
-        print(f'train_loader: {len(train_loader)}, val_loader: {len(val_loader)}, test_loader: {len(test_loader)}')
-        # 1) ModelPPGOnlyNoInfo
-        # print("\n=== Train ModelPPGOnlyNoInfo ===")
-        # model_noinfo= ModelPPGOnlyNoInfo(base_ch=32, attn_dim=64, n_heads=4)
-        # #計算參數
-        # total_params = sum(p.numel() for p in model_noinfo.parameters())
-        # print(f"Total parameters: {total_params}")
-        # model_noinfo= self.train_model(model_noinfo, train_loader, val_loader)
-        # loss_n, mae_n= self.eval_model(model_noinfo, test_loader)
-        # print(f"[PPGOnlyNoInfo] Test MSE={loss_n:.4f}, MAE={mae_n:.4f}")
-
-        # 2) ModelPPGOnly (前面有 personal_info)
-        # print("\n=== Train ModelPPGOnly ===")
-        # from __main__ import ModelPPGOnly  # 假設在同檔案可直接用
-        # model_ppg_only= ModelPPGOnly(info_dim=5, wave_out_ch=64, d_model=64, n_heads=4)
-        # model_ppg_only= self.train_model(model_ppg_only, train_loader, val_loader)
-        # loss_o, mae_o= self.eval_model(model_ppg_only, test_loader)
-        # print(f"[PPGOnly + Info] Test MSE={loss_o:.4f}, MAE={mae_o:.4f}")
-
-        # 3) ModelPPGECG
-        print("\n=== Train ModelPPGECG ===")
-        model_ppg_ecg= ModelPPGECG(info_dim=4, wave_out_ch=32, d_model=32, n_heads=4)
-        model_ppg_ecg= self.train_model(model_ppg_ecg, train_loader, val_loader)
-        loss_e, mae_e= self.eval_model(model_ppg_ecg, test_loader)
-        print(f"[PPG+ECG + Info] Test MSE={loss_e:.4f}, MAE={mae_e:.4f}")
-
-        # print("\n=== Summary ===")
-        # print(f"PPGOnlyNoInfo => MSE={loss_n:.4f}, MAE={mae_n:.4f}")
-        # print(f"PPGOnly+Info  => MSE={loss_o:.4f}, MAE={mae_o:.4f}")
-        # print(f"PPG+ECG+Info  => MSE={loss_e:.4f}, MAE={mae_e:.4f}")
+        train_loader, val_loader, test_loader = self.create_dataloaders()
+        print(f"train_loader: {len(train_loader)}, val_loader: {len(val_loader)}, test_loader: {len(test_loader)}")
+        # 本範例主要示範 ModelPPGECG 的訓練（納入 vascular_properties）
+        print("\n=== Training ModelPPGECG (PPG + ECG + Info + Vascular) ===")
+        # 參數設定：info_dim=4 (個人資訊維度)，vascular_dim=3 (vascular_properties 維度)
+        model_ppg_ecg = ModelPPGECG(info_dim=4, vascular_dim=3, wave_out_ch=32, d_model=32, n_heads=4)
+        model_ppg_ecg = self.train_model(model_ppg_ecg, train_loader, val_loader)
+        test_loss, test_mae = self.eval_model(model_ppg_ecg, test_loader)
+        print(f"[PPG+ECG+Info+Vascular] Test MSE={test_loss:.4f}, Test MAE={test_mae:.4f}")
 
 ############################################################
 # main
