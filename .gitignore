@@ -1,3 +1,11 @@
+*.pyc
+*.pyo
+*.log
+*.out
+*.tmp
+*.cache
+__pycache__/
+*.swp
 *.db
 *.h5
 *.txt
@@ -16,3 +24,21 @@ pulsedb_annotations
 *npy
 
 PulseDB2_0/*
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+# Python 虛擬環境資料夾
+venv/
+env/
+
+build/
+dist/
+*.egg-info/
+
+# 你的資料檔 (若你有其他大型資料 / 機敏檔案也可在此新增)
+data/
+*.h5
+*.csv
+.conda/ 
