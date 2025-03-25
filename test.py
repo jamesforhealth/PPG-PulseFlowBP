@@ -1,19 +1,12 @@
-import matplotlib.pyplot as plt
-import numpy as np
+import vector_quantize_pytorch as vq
+import torch
 
-# 生成隨機分佈的點
-mean = 0
-std_dev = 1
-num_points = 1000
+a = torch.FloatTensor([-0.1, 0.5, 0.2, 0.33, -0.6, 0.2]).view(1, 3, 2)
+print('a=', a)
 
-x = np.random.normal(mean, std_dev, num_points)
-y = np.random.normal(mean, std_dev, num_points)
+quantizer = vq.VectorQuantize(dim=2, codebook_size=6)
 
-# 繪製散佈圖
-plt.figure(figsize=(10, 6))
-plt.scatter(x, y, alpha=0.5)
-plt.title('Scatter Plot of 1000 Random Points with Normal Distribution')
-plt.xlabel('X')
-plt.ylabel('Y')
-plt.grid(True)
-plt.show()
+quantized, indices, loss = quantizer(a)
+print('quantized', quantized)
+print('indices', indices)
+print('loss', loss)

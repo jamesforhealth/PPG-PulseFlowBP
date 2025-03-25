@@ -1,0 +1,6 @@
+{
+    "test_loss": 12.045066388345534,
+    "test_reg_loss": 10.213831470397212,
+    "test_contr_loss": 18.31234913487588,
+    "test_phys_loss": 0.0,
+    "test_sbp_mae": 

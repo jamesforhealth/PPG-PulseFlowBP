@@ -178,6 +178,46 @@ def check_peaks_order(peaks_dict):
             return False
     return True
 
+def compute_time_diff_statistics(seq1, seq2, fs=125):
+    """
+    同時計算 seq1 與 seq2 之間的相對時間差之平均與標準差（單位: 毫秒）。
+    注意這裡的邏輯和原先 compute_average_time_diff 類似，只是改為回傳 (mean, std)。
+    """
+    seq1 = np.sort(np.array(seq1))
+    seq2 = np.sort(np.array(seq2))
+    time_diffs_samples = []
+    for idx1 in seq1:
+        idx2_candidates = seq2[seq2 < idx1]
+        if len(idx2_candidates) == 0:
+            continue
+        idx2 = idx2_candidates[-1]
+        diff_samples = idx1 - idx2
+        time_diffs_samples.append(diff_samples)
+
+    if len(time_diffs_samples) == 0:
+        return 0.0, 0.0
+
+    time_diffs_samples = np.array(time_diffs_samples)
+    mean_diff_samples = np.mean(time_diffs_samples)
+    std_diff_samples = np.std(time_diffs_samples)
+    mean_diff_ms = (mean_diff_samples / fs) * 1000.0
+    std_diff_ms = (std_diff_samples / fs) * 1000.0
+    return mean_diff_ms, std_diff_ms
+
+def compute_rr_statistics(r_peaks, fs=125):
+    """
+    計算 ECG R-peaks 之間 RR interval 的平均和標準差（單位: 毫秒）。
+    """
+    r_peaks = np.sort(np.array(r_peaks))
+    if len(r_peaks) < 2:
+        return 0.0, 0.0
+    
+    intervals = np.diff(r_peaks)
+    mean_interval = np.mean(intervals)
+    std_interval = np.std(intervals)
+    mean_interval_ms = (mean_interval / fs) * 1000.0
+    std_interval_ms = (std_interval / fs) * 1000.0
+    return mean_interval_ms, std_interval_ms
 
 ################################################
 # 2) 資料處理主類別 (保留原先 process_file_1250 等邏輯)
@@ -238,7 +278,7 @@ class VitalDBDatasetPreparator:
                 ecg_realpeaks_all = []
                 for idx, ref in enumerate(matdata['ECG_RPeaks'][0]):
                     approx_peaks = self.extract_peaks(f, ref)
-                    real_peaks   = find_real_peaks(ecg_f[idx], approx_peaks, fs=125)
+                    real_peaks = find_real_peaks(ecg_f[idx], approx_peaks, fs=125)
                     ecg_realpeaks_all.append(real_peaks)
                 ecg_realpeaks_all = np.array(ecg_realpeaks_all, dtype=object)
 
@@ -300,9 +340,19 @@ class VitalDBDatasetPreparator:
                         discarded+=1
                         continue
 
-                    # d) 若通過 => annotation matrix / ptt / pat
-                    ptt_val= compute_average_time_diff(ppg_speaks_all[i], ppg_turns_all[i], fs=125)
-                    pat_val= compute_average_time_diff(ppg_turns_all[i], ecg_realpeaks_all[i], fs=125)
+                    # d) 若通過 => annotation matrix / ptt(平均+std) / pat(平均+std) / rr(平均+std)
+                    ptt_mean, ptt_std = compute_time_diff_statistics(
+                        ppg_speaks_all[i], 
+                        ppg_turns_all[i], 
+                        fs=125
+                    )
+                    pat_mean, pat_std = compute_time_diff_statistics(
+                        ppg_turns_all[i], 
+                        ecg_realpeaks_all[i], 
+                        fs=125
+                    )
+                    rr_mean, rr_std = compute_rr_statistics(ecg_realpeaks_all[i], fs=125)
+
                     annotation_mat= create_annotation_matrix(1250, peaks_dict)
 
                     data_item= {
@@ -313,7 +363,7 @@ class VitalDBDatasetPreparator:
                         'segsbp': seg_sbp[i],
                         'segdbp': seg_dbp[i],
                         'personal_info': personal_info,
-                        'vascular_properties': np.array([ptt_val, pat_val], dtype=np.float32)
+                        'vascular_properties': np.array([ptt_mean, ptt_std, pat_mean, pat_std, rr_mean, rr_std], dtype=np.float32)
                     }
                     processed_data.append(data_item)
                     qualified+=1
@@ -428,7 +478,7 @@ class VitalDBDatasetPreparator:
             f_out.create_dataset('segsbp',   (n_samples,),         dtype='float32')
             f_out.create_dataset('segdbp',   (n_samples,),         dtype='float32')
             f_out.create_dataset('personal_info',(n_samples,4),    dtype='float32')
-            f_out.create_dataset('vascular_properties',(n_samples,2), dtype='float32')
+            f_out.create_dataset('vascular_properties',(n_samples,6), dtype='float32')
 
             for i, item in enumerate(all_data):
                 f_out['ppg'][i]      = item['ppg']
@@ -450,7 +500,7 @@ if __name__=="__main__":
     # 1) 建立物件
     preparator = VitalDBDatasetPreparator(
         data_dir="PulseDB_Vital",          # 您的 .mat 檔目錄
-        output_dir="training_data_VitalDB_quality", 
+        output_dir="training_data_VitalDB_quality2", 
         n_folds=10
     )
 
@@ -460,12 +510,12 @@ if __name__=="__main__":
     # 3) 第二步：依某個 fold 列表產生 HDF5
     #    例如要處理 training_1_files.txt -> training_1.h5
     # 同理:
-    preparator.write_h5_from_file_list("training_data_VitalDB_quality/val_files.txt", "validation.h5")
-    preparator.write_h5_from_file_list("training_data_VitalDB_quality/test_files.txt", "test.h5")
+    preparator.write_h5_from_file_list("training_data_VitalDB_quality2/val_files.txt", "validation.h5")
+    preparator.write_h5_from_file_list("training_data_VitalDB_quality2/test_files.txt", "test.h5")
 
     for i in range(1,10):
         preparator.write_h5_from_file_list(
-            file_list_txt=f"training_data_VitalDB_quality/training_{i}_files.txt",
+            file_list_txt=f"training_data_VitalDB_quality2/training_{i}_files.txt",
             output_h5=f"training_{i}.h5"
         )
     
