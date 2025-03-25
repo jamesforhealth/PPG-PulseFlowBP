@@ -9,6 +9,8 @@ __pycache__/
 *.db
 *.h5
 *.txt
+*.pth
+*.png
 abp1250model*
 PulseDB_MIMIC/*
 PulseDB_Vital/*
